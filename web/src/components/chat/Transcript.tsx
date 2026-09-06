@@ -1,4 +1,13 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
@@ -53,12 +62,6 @@ import {
 } from "@/components/chat/chatBubbleParts";
 
 export interface TranscriptProps {
-  /**
-   * Deferred conversation id — keys the `<Conversation>` subtree so it
-   * remounts at transition priority rather than blocking the interaction frame.
-   * Passed from ChatPage as `useDeferredValue(urlConvId)`.
-   */
-  conversationKey: string | null | undefined;
   /** Ref callback for the conversation wrapper element (SelectionPopup scope +
    *  JumpToTopButton hover ancestor). Owned by the parent, forwarded here. */
   setConversationEl: (el: HTMLDivElement | null) => void;
@@ -92,7 +95,6 @@ export interface TranscriptProps {
  * dialogs bail out via React's normal prop-equality check.
  */
 function TranscriptImpl({
-  conversationKey,
   setConversationEl,
   containerEl,
   scroller,
@@ -115,6 +117,13 @@ function TranscriptImpl({
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
   const hasTasks = useChatStore((s) => s.todos.length > 0);
+  const conversationId = useChatStore((s) => s.conversationId);
+  // Deferred with the SAME cadence as `listBubbles` below, so it changes in the
+  // same committed render the new conversation's bubbles paint in. The scroll
+  // reset keys on this (not the immediate id) so it restores position AFTER the
+  // deferred content is in the DOM — pinning against the old content would land
+  // mid-conversation once the deferred swap commits.
+  const listConversationId = useDeferredValue(conversationId);
 
   // Build bubbles once per blocks/activeResponse change. Per-surface reuse
   // cache so a streaming append rebuilds only the active bubble, reusing the
@@ -215,9 +224,19 @@ function TranscriptImpl({
     () => (pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles)),
     [bubbles, pendingElicitations.length],
   );
+  // The windowed bubble list is the expensive render (markdown/tool subtrees).
+  // Feed it a DEFERRED copy so a conversation switch — which swaps `blocks`
+  // synchronously via the store — commits the cheap transcript shell (empty
+  // state, indicators, rail, spacer) immediately and renders the heavy list at
+  // transition priority, off the click frame. The Composer is a sibling outside
+  // <Transcript>, so it is entirely unaffected. During steady-state streaming
+  // React isn't busy, so useDeferredValue commits promptly (no token lag).
+  // lastAssistantIndex is derived from the SAME deferred list so the live-turn
+  // flag matches what the list actually renders.
+  const listBubbles = useDeferredValue(streamBubbles);
   const lastAssistantIndex = useMemo(
-    () => liveCandidateAssistantIndex(streamBubbles),
-    [streamBubbles],
+    () => liveCandidateAssistantIndex(listBubbles),
+    [listBubbles],
   );
 
   // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) user-turn navigation.
@@ -263,7 +282,7 @@ function TranscriptImpl({
             remounted (that flashed scrollTop to 0 mid-teardown); instead this
             resets scroll position imperatively for the new conversation. Driven
             by the DEFERRED key, so the switch stays off the click frame. */}
-            <ConversationSwitchReset />
+            <ConversationSwitchReset conversationId={listConversationId} />
             <ScrollToBottomOnSend nonce={sendScrollNonce} />
             <KeepBottomOnViewportResize />
             <ConversationScrollRefBridge onScroller={setScroller} />
@@ -291,11 +310,11 @@ function TranscriptImpl({
                 {/* Older pages prepend here while their request is in flight. */}
                 {loadingMoreHistory && <HistoryLoadingIndicator />}
                 <VirtualBubbleList
-                  bubbles={streamBubbles}
+                  bubbles={listBubbles}
                   scrollEl={scroller?.el ?? null}
                   lastAssistantIndex={lastAssistantIndex}
                   showsWorking={showsWorking}
-                  conversationKey={conversationKey}
+                  listConversationId={listConversationId}
                   onGeometryChange={onGeometryChange}
                 />
                 {/* Pending elicitation cards, floated to the bottom of the chat
@@ -443,6 +462,12 @@ const BOTTOM_EPSILON_PX = 8;
 function isElAtBottom(el: HTMLElement): boolean {
   return el.scrollHeight - el.clientHeight - el.scrollTop <= BOTTOM_EPSILON_PX;
 }
+// The conversation whose scroll the reset is actively restoring. Its own
+// programmatic scrollTop writes fire scroll events; without this the live save
+// would record those transient values and clobber the real saved view (and flip
+// its at-bottom flag), which the reset then reads back — a jitter feedback loop.
+// The save skips while its conversation is being restored.
+let restoringConversation: string | null = null;
 
 /**
  * Restores the incoming conversation's scroll position on a switch, replacing
@@ -451,37 +476,83 @@ function isElAtBottom(el: HTMLElement): boolean {
  * `<Conversation>` for the stick context. The saved view is written live by
  * VirtualBubbleList while the conversation is displayed; this only restores it.
  */
-function ConversationSwitchReset() {
+function ConversationSwitchReset({
+  conversationId,
+}: {
+  conversationId: string | null | undefined;
+}) {
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef: React.RefObject<HTMLElement>;
     stopScroll: () => void;
   };
-  // Driven by the store's IMMEDIATE conversation id (not the deferred key) so
-  // the correction runs in the layout phase of the commit that swaps the
-  // blocks, before an intermediate frame paints at a stale position.
-  const conversationId = useChatStore((s) => s.conversationId);
+  // Read ctx through a ref so the effect fires ONCE per conversation change, not
+  // whenever the stick context object gets a new identity (which re-ran the
+  // restore repeatedly, each run reading a transient saved offset the prior
+  // run's pin had written — jitter).
+  const ctxRef = useRef(ctx);
+  ctxRef.current = ctx;
+  // `conversationId` is the DEFERRED id (see TranscriptImpl) — it changes in the
+  // same committed render the new conversation's bubbles paint in, so this
+  // restores against the freshly rendered content, not the outgoing one.
   useLayoutEffect(() => {
-    const el = ctx.scrollRef?.current;
-    if (!el) return;
-    // Restore the incoming conversation's saved view (written live by
-    // VirtualBubbleList); no saved view (first visit) → bottom. Bottom is a
-    // moving target — the virtualizer measures rows after mount, so the height
-    // grows over the next few frames. A ResizeObserver on the content re-applies
-    // the target on each growth (pre-paint), holding it through the settle
-    // without polling; it's inert once the height stops changing and is torn
-    // down on the next switch.
-    ctx.stopScroll();
-    const saved = conversationId ? transcriptViewCache.get(conversationId) : undefined;
-    const toBottom = !saved || saved.atBottom;
-    const apply = () => {
-      el.scrollTop = toBottom ? Math.max(0, el.scrollHeight - el.clientHeight) : saved.offset;
+    const c = ctxRef.current;
+    const el = c.scrollRef?.current;
+    if (!el || !conversationId) return;
+    // Suppress the live save for this conversation while we restore: our own
+    // pin writes fire scroll events, and saving those transient values would
+    // clobber the real saved view and feed a jitter loop.
+    restoringConversation = conversationId;
+    const saved = transcriptViewCache.get(conversationId);
+    const done = () => {
+      if (restoringConversation === conversationId) restoringConversation = null;
     };
-    apply();
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(apply);
-    observer.observe(el.firstElementChild ?? el); // the content, which grows as rows measure
-    return () => observer.disconnect();
-  }, [conversationId, ctx]);
+    if (!saved || saved.atBottom) {
+      // At bottom: hand it to StickToBottom's own lock, which is built to stay
+      // pinned to the bottom through ALL later content growth (rows measuring,
+      // the deferred list committing, late images) — no finite observer that
+      // could disconnect a frame before one last growth and leave it short.
+      // The deferred `conversationId` means we run after the new content is in
+      // the DOM, so the lock has no stale frame to flash.
+      c.scrollToBottom("instant");
+      // Lift the save-suppression after the settle so genuine user scrolls
+      // record again; the lock itself keeps pinning meanwhile.
+      requestAnimationFrame(() => requestAnimationFrame(done));
+      return;
+    }
+    // Scrolled up: release the lock and restore the saved pixel offset, holding
+    // it across the settle (deferred commit + row measurement) with a short
+    // read-free observer, then lift suppression.
+    c.stopScroll();
+    const content = el.firstElementChild as HTMLElement | null;
+    const pin = () => {
+      el.scrollTop = saved.offset;
+    };
+    pin();
+    if (!content || typeof ResizeObserver === "undefined") {
+      done();
+      return;
+    }
+    let stable = 0;
+    let last = -1;
+    const observer = new ResizeObserver(([entry]) => {
+      const h = entry?.contentRect.height ?? 0;
+      pin();
+      if (h === last) {
+        if (++stable >= 3) {
+          observer.disconnect();
+          done();
+        }
+      } else {
+        stable = 0;
+        last = h;
+      }
+    });
+    observer.observe(content);
+    return () => {
+      observer.disconnect();
+      done();
+    };
+  }, [conversationId]);
   return null;
 }
 
@@ -490,40 +561,40 @@ function VirtualBubbleList({
   scrollEl,
   lastAssistantIndex,
   showsWorking,
-  conversationKey,
+  listConversationId,
   onGeometryChange,
 }: {
   bubbles: Bubble[];
   scrollEl: HTMLElement | null;
   lastAssistantIndex: number;
   showsWorking: boolean;
-  /** Deferred conversation id; used to gate the scroll save so a transitional
-   *  scroll during a switch (deferred key still lagging) can't corrupt a
-   *  conversation's saved view. */
-  conversationKey: string | null | undefined;
+  /** The conversation whose bubbles are CURRENTLY rendered (deferred id, in sync
+   *  with `bubbles`). The scroll save keys on this so it attributes scroll to
+   *  the displayed conversation and skips saves fired mid-switch (when the store
+   *  has moved on but the deferred content — hence this id — hasn't caught up).*/
+  listConversationId: string | null | undefined;
   /** Publishes virtualizer-derived geometry up to the rail/spacer. */
   onGeometryChange: (geometry: TranscriptGeometry) => void;
 }) {
-  // Save this conversation's live scroll view (real scrollTop + at-bottom flag)
-  // as the reader scrolls, so a later return restores it. Keyed by the store's
-  // conversationId (leads the deferred key), and gated on the deferred key
-  // having caught up (store id === deferred key) so a scroll fired mid-switch —
-  // when the shared element is transitioning between conversations — can't be
-  // attributed to the wrong one.
+  // Save the displayed conversation's live scroll view (real scrollTop +
+  // at-bottom flag) as the reader scrolls, so a later return restores it. Keyed
+  // by `listConversationId` (the id of the content actually on screen) and
+  // gated on the store having settled to it, so a scroll fired mid-switch — when
+  // the store id leads the deferred content — can't be attributed to the wrong
+  // conversation.
   const storeConvId = useChatStore((s) => s.conversationId);
   useEffect(() => {
-    if (!scrollEl || !storeConvId) return;
+    if (!scrollEl || !listConversationId) return;
     const save = () => {
-      if (storeConvId !== conversationKey) return; // a switch is in flight
-      rememberTranscriptView(storeConvId, {
-        atBottom: isElAtBottom(scrollEl),
-        offset: Math.round(scrollEl.scrollTop),
-      });
+      if (storeConvId !== listConversationId) return; // a switch is in flight
+      if (restoringConversation === listConversationId) return; // our own pin, not a user scroll
+      const snap = { atBottom: isElAtBottom(scrollEl), offset: Math.round(scrollEl.scrollTop) };
+      rememberTranscriptView(listConversationId, snap);
     };
     save();
     scrollEl.addEventListener("scroll", save, { passive: true });
     return () => scrollEl.removeEventListener("scroll", save);
-  }, [scrollEl, storeConvId, conversationKey]);
+  }, [scrollEl, storeConvId, listConversationId]);
 
   const wrapperRef = useRef<HTMLDivElement>(null);
   // The list isn't the scroll container's first child — indicators, padding,
