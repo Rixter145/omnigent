@@ -31,6 +31,27 @@ _ATTACHMENT_MARKER_RE = re.compile(
 DEFAULT_GENERATED_TITLE_MAX_CHARS = 100
 USER_SESSION_TITLE_MAX_CHARS = 200
 
+# Workspace-homed storage adapters treat a raw "/" in a title as a path
+# separator and reject the write, so machine-generated titles swap it for the
+# visually identical division slash. Manual renames stay verbatim: the backend
+# remains authoritative there and the UI surfaces its rejection.
+_TITLE_SAFE_SLASH = "∕"  # DIVISION SLASH "∕"
+
+
+def storage_safe_title(value: str) -> str:
+    """
+    Replace raw ``/`` path separators with a lookalike division slash.
+
+    Applied to every machine-generated title (deterministic seeds and
+    normalized model output) so auto-naming never hands a storage adapter
+    a title it treats as a path, e.g. ``"docs/setup"`` → ``"docs∕setup"``.
+
+    :param value: Candidate title text, e.g. ``"https://example.com/docs"``.
+    :returns: The same text with every ``/`` replaced by ``∕`` (U+2215).
+    """
+    return value.replace("/", _TITLE_SAFE_SLASH)
+
+
 # ── Conversation ──────────────────────────────────────
 
 
@@ -313,7 +334,9 @@ def synthesize_conversation_title(
     Non-text blocks (``input_image``, ``input_file``) are skipped, and
     lines matching the native executors' attachment path markers
     (:data:`_ATTACHMENT_MARKER_RE`) are dropped so attachments never
-    leak temp-file paths into the title.
+    leak temp-file paths into the title. Raw ``/`` path separators are
+    swapped via :func:`storage_safe_title` so a URL-first prompt (or a
+    ``/skill`` command) seeds a title every storage adapter accepts.
 
     :param content: Message content blocks, e.g.
         ``[{"type": "input_text", "text": "Hello"}]``.
@@ -332,7 +355,7 @@ def synthesize_conversation_title(
                     if not _ATTACHMENT_MARKER_RE.match(line.strip())
                 ]
                 parts.append("\n".join(kept_lines))
-    collapsed = " ".join(" ".join(parts).split())
+    collapsed = storage_safe_title(" ".join(" ".join(parts).split()))
     if not collapsed:
         return None
     if len(collapsed) <= limit:

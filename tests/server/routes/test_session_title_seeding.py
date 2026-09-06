@@ -32,7 +32,9 @@ def test_skill_slash_command_titles_from_typed_command() -> None:
     content = _title_content_from_item(item)
     assert content == [{"type": "input_text", "text": "/my-plugin:my-skill ARG-123"}]
     # And it synthesizes a real, descriptive title (not the "Claude Code" default).
-    assert synthesize_conversation_title(content) == "/my-plugin:my-skill ARG-123"
+    # The leading "/" becomes the storage-safe division slash: workspace-homed
+    # stores reject titles that read as paths.
+    assert synthesize_conversation_title(content) == "∕my-plugin:my-skill ARG-123"
 
 
 def test_skill_slash_command_without_arguments_titles_from_command_only() -> None:

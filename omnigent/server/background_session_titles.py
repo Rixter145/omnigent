@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 from omnigent.entities.conversation import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     USER_SESSION_TITLE_MAX_CHARS,
+    storage_safe_title,
     synthesize_conversation_title,
 )
 from omnigent.harness_aliases import canonicalize_harness
@@ -63,12 +64,16 @@ def normalize_background_title(
     max_chars: int = BACKGROUND_TITLE_MAX_CHARS,
     truncate_overflow: bool = False,
 ) -> str | None:
-    """Return a compact title or ``None`` when model output is unusable."""
+    """Return a compact title or ``None`` when model output is unusable.
+
+    Raw ``/`` path separators are swapped via :func:`storage_safe_title`
+    so a generated title never reads as a path to the storage adapter.
+    """
     if not value:
         return None
     first_line = next((line.strip() for line in value.splitlines() if line.strip()), "")
     title = " ".join(first_line.strip(_TITLE_WRAPPERS).split())
-    title = _TRAILING_PUNCTUATION.sub("", title).strip()
+    title = storage_safe_title(_TRAILING_PUNCTUATION.sub("", title).strip())
     if len(title) > max_chars:
         if not truncate_overflow:
             return None

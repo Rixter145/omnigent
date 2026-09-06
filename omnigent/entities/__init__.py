@@ -24,6 +24,7 @@ from omnigent.entities.conversation import (
     SlashCommandData,
     TerminalCommandData,
     parse_item_data,
+    storage_safe_title,
     synthesize_conversation_title,
 )
 from omnigent.entities.device_grant import DeviceGrant
@@ -84,5 +85,6 @@ __all__ = [
     "get_resource_by_id",
     "parse_item_data",
     "resolve_terminal_entry_by_resource_id",
+    "storage_safe_title",
     "synthesize_conversation_title",
 ]

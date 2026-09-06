@@ -100,7 +100,9 @@ async def test_prepare_background_title_from_slash_command(db_uri: str) -> None:
 
     assert pending is not None
     assert pending.request.prompt == "/grill-me review this plan"
-    assert pending.expected_seed_title == "/grill-me review this plan"
+    # The expected seed mirrors the persisted seed, which swaps the raw "/"
+    # for the storage-safe division slash — so the CAS handshake still matches.
+    assert pending.expected_seed_title == "∕grill-me review this plan"
 
 
 @pytest.mark.parametrize("excluded_session", ["titled", "child"])
@@ -286,6 +288,14 @@ async def test_title_normalizer_rejects_empty_and_oversized_output() -> None:
     assert normalize_background_title(None) is None
     assert normalize_background_title("   \n  ") is None
     assert normalize_background_title("x" * (BACKGROUND_TITLE_MAX_CHARS + 1)) is None
+
+
+async def test_title_normalizer_swaps_path_separators() -> None:
+    # Workspace-homed stores reject titles containing a raw "/" as invalid
+    # paths, so normalized model output must never carry one.
+    normalized = normalize_background_title("Review docs/setup page")
+    assert normalized == "Review docs∕setup page"
+    assert "/" not in normalized
 
 
 async def test_custom_title_instructions_allow_longer_output(db_uri: str) -> None:

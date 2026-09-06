@@ -164,3 +164,16 @@ def test_synthesize_conversation_title_respects_custom_limit() -> None:
     """Custom ``limit`` is honored."""
     content = [{"type": "input_text", "text": "a" * 50}]
     assert synthesize_conversation_title(content, limit=10) == "a" * 9 + "…"
+
+
+def test_synthesize_conversation_title_swaps_path_separators() -> None:
+    """A URL-first prompt seeds a storage-safe title with no raw ``/``.
+
+    Workspace-homed storage adapters treat ``/`` in a title as a path
+    separator and reject the write, so the seed swaps it for the visually
+    identical division slash instead of persisting the prompt verbatim.
+    """
+    content = [{"type": "input_text", "text": "https://example.com/docs/setup review this page"}]
+    title = synthesize_conversation_title(content)
+    assert title == "https:∕∕example.com∕docs∕setup review this page"
+    assert "/" not in title
