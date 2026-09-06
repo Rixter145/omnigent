@@ -470,7 +470,7 @@ export function AppShell() {
   });
   // Full agent object (mcp_servers + policies) for the header info icon.
   // react-query-cached, so this shares the fetch ChatPage's picker makes.
-  const { data: boundAgent } = useSessionAgent(conversationId ?? null);
+  const { data: boundAgent } = useSessionAgent(serverConversationId ?? null);
   const permissionLevel = derivePermissionLevel(
     activeSession,
     sessionLoading,
@@ -921,7 +921,7 @@ export function AppShell() {
   // can tell BlockRenderer which inline code spans are real workspace files.
   // We use the changed-files list (not the flat top-level directory listing)
   // because it contains full relative paths like `web/src/shell/Foo.tsx`.
-  const changedFilesQuery = useWorkspaceChangedFiles(conversationId);
+  const changedFilesQuery = useWorkspaceChangedFiles(serverConversationId);
   const changedFilePaths = useMemo(
     () => new Set(changedFilesQuery.data?.data.map((f) => f.path) ?? []),
     [changedFilesQuery.data],
