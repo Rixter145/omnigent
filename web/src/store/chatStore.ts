@@ -102,6 +102,10 @@ import {
   type ConversationsInfiniteData,
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
+// Re-exported below so existing `@/store/chatStore` importers keep working; the
+// pure helpers live in a leaf module so low-level session hooks can gate on temp
+// ids without an import cycle back to the store.
+import { isTempConvId, newTempConvId } from "@/lib/tempConversationId";
 import { useTerminalActivityStore } from "./terminalActivity";
 import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import type {
@@ -1149,21 +1153,8 @@ const sendChains = new Map<string | symbol, SendChain>();
 // non-string key can never collide with a conversation id.
 const NEW_SESSION_SEND_CHAIN_KEY = Symbol("new-session");
 
-/** Prefix of a client-only conversation id, shown while `createSession` runs. */
-const TEMP_CONV_ID_PREFIX = "temp:";
-
-/** Mint a fresh client-only conversation id: `temp:<32-bit hex>`. */
-function newTempConvId(): string {
-  const hex = Math.floor(Math.random() * 0x1_0000_0000)
-    .toString(16)
-    .padStart(8, "0");
-  return `${TEMP_CONV_ID_PREFIX}${hex}`;
-}
-
-/** Whether an id is a client-only temp conversation id (not a server session). */
-export function isTempConvId(id: string | null | undefined): boolean {
-  return typeof id === "string" && id.startsWith(TEMP_CONV_ID_PREFIX);
-}
+// Re-export for callers that already import it from the store.
+export { isTempConvId } from "@/lib/tempConversationId";
 
 /**
  * A temp URL with no live registry entry — a reload or fresh tab landed on a
