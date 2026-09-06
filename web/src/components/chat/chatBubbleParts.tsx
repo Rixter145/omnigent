@@ -1215,6 +1215,34 @@ export function LatestTurnSpacer({
     undefined,
   );
   const initialCommittedUserIdsRef = useRef<Set<string> | null>(null);
+  // Bounded rAF retries for capturing the anchor when committed blocks exist but
+  // their rows haven't mounted yet (windowed transcript, published a frame
+  // before the virtualizer fills its window). A resize we could observe isn't
+  // guaranteed — the wrapper height is fixed to the estimate — so we drive the
+  // retry ourselves rather than wait for one. When the budget runs out (e.g. a
+  // tool-only trailing turn that never has an anchor) capture settles to `null`.
+  const captureFrameRef = useRef(0);
+  const captureAttemptsRef = useRef(0);
+  // The anchor node measured last, and a flag the ResizeObserver sets to force
+  // the next measure past the same-node skip (viewport/content size changed).
+  const lastAnchorNodeRef = useRef<HTMLElement | null>(null);
+  const forceMeasureRef = useRef(true);
+
+  // The transcript no longer remounts on a conversation switch, so this
+  // component is not recreated — reset the per-conversation capture state when
+  // the active conversation changes so the new conversation captures its own
+  // initial anchor instead of holding the previous one's.
+  const conversationId = useChatStore((s) => s.conversationId);
+  const prevConversationIdRef = useRef(conversationId);
+  if (prevConversationIdRef.current !== conversationId) {
+    prevConversationIdRef.current = conversationId;
+    initialAnchorRef.current = undefined;
+    initialCommittedUserIdsRef.current = null; // recomputed below from new blocks
+    captureAttemptsRef.current = 0;
+    lastAnchorNodeRef.current = null;
+    forceMeasureRef.current = true;
+    if (spacerRef.current) spacerRef.current.style.display = "";
+  }
   if (initialCommittedUserIdsRef.current === null) {
     const ids = new Set<string>();
     for (const block of useChatStore.getState().blocks) {
@@ -1228,18 +1256,6 @@ export function LatestTurnSpacer({
     }
     initialCommittedUserIdsRef.current = ids;
   }
-  // Bounded rAF retries for capturing the anchor when committed blocks exist but
-  // their rows haven't mounted yet (windowed transcript, published a frame
-  // before the virtualizer fills its window). A resize we could observe isn't
-  // guaranteed — the wrapper height is fixed to the estimate — so we drive the
-  // retry ourselves rather than wait for one. When the budget runs out (e.g. a
-  // tool-only trailing turn that never has an anchor) capture settles to `null`.
-  const captureFrameRef = useRef(0);
-  const captureAttemptsRef = useRef(0);
-  // The anchor node measured last, and a flag the ResizeObserver sets to force
-  // the next measure past the same-node skip (viewport/content size changed).
-  const lastAnchorNodeRef = useRef<HTMLElement | null>(null);
-  const forceMeasureRef = useRef(true);
 
   const measure = useCallback(() => {
     const scrollEl = scrollElement ?? ctx.scrollRef?.current;

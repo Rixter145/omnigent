@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
   Conversation,
   ConversationContent,
@@ -247,10 +248,7 @@ function TranscriptImpl({
         ref={setConversationEl}
         className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
       >
-        <Conversation
-          key={conversationKey ?? "landing"}
-          className={cn(!hasTasks && "chat-scroll-fade", "flex-1")}
-        >
+        <Conversation className={cn(!hasTasks && "chat-scroll-fade", "flex-1")}>
           <ConversationContent
             scrollClassName="transcript-hide-native-scrollbar"
             className={cn(
@@ -261,6 +259,11 @@ function TranscriptImpl({
             )}
           >
             {/* Scroll helpers — must live inside StickToBottom to access context. */}
+            {/* On a conversation switch the <Conversation> subtree is no longer
+            remounted (that flashed scrollTop to 0 mid-teardown); instead this
+            resets scroll position imperatively for the new conversation. Driven
+            by the DEFERRED key, so the switch stays off the click frame. */}
+            <ConversationSwitchReset />
             <ScrollToBottomOnSend nonce={sendScrollNonce} />
             <KeepBottomOnViewportResize />
             <ConversationScrollRefBridge onScroller={setScroller} />
@@ -292,6 +295,7 @@ function TranscriptImpl({
                   scrollEl={scroller?.el ?? null}
                   lastAssistantIndex={lastAssistantIndex}
                   showsWorking={showsWorking}
+                  conversationKey={conversationKey}
                   onGeometryChange={onGeometryChange}
                 />
                 {/* Pending elicitation cards, floated to the bottom of the chat
@@ -410,20 +414,117 @@ export interface TranscriptGeometry {
   rangeNonce: number;
 }
 
+/**
+ * Where each conversation was last left, so returning restores it. `atBottom`
+ * is stored as a flag rather than the pixel offset because "pinned to the
+ * bottom" must survive the transcript re-measuring to a different height on
+ * return — restoring a stale pixel would land mid-scroll. Written by
+ * `ConversationSwitchReset` at the switch boundary (reading the live
+ * scrollTop), read by it on the way back. Module-level so it outlives
+ * re-renders; bounded so a long session doesn't retain every entry forever.
+ */
+interface TranscriptViewSnapshot {
+  atBottom: boolean;
+  offset: number;
+}
+const MAX_CACHED_VIEWS = 24;
+const transcriptViewCache = new Map<string, TranscriptViewSnapshot>();
+function rememberTranscriptView(convId: string, snap: TranscriptViewSnapshot): void {
+  transcriptViewCache.delete(convId); // re-insert to refresh LRU order
+  transcriptViewCache.set(convId, snap);
+  while (transcriptViewCache.size > MAX_CACHED_VIEWS) {
+    const oldest = transcriptViewCache.keys().next().value;
+    if (oldest === undefined) break;
+    transcriptViewCache.delete(oldest);
+  }
+}
+/** Physical "is this scroll element at (or within a hair of) its bottom". */
+const BOTTOM_EPSILON_PX = 8;
+function isElAtBottom(el: HTMLElement): boolean {
+  return el.scrollHeight - el.clientHeight - el.scrollTop <= BOTTOM_EPSILON_PX;
+}
+
+/**
+ * Restores the incoming conversation's scroll position on a switch, replacing
+ * the full `<Conversation>` remount the deferred key used to force (which
+ * flashed scrollTop to 0 as the subtree tore down). Lives inside
+ * `<Conversation>` for the stick context. The saved view is written live by
+ * VirtualBubbleList while the conversation is displayed; this only restores it.
+ */
+function ConversationSwitchReset() {
+  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
+    scrollRef: React.RefObject<HTMLElement>;
+    stopScroll: () => void;
+  };
+  // Driven by the store's IMMEDIATE conversation id (not the deferred key) so
+  // the correction runs in the layout phase of the commit that swaps the
+  // blocks, before an intermediate frame paints at a stale position.
+  const conversationId = useChatStore((s) => s.conversationId);
+  useLayoutEffect(() => {
+    const el = ctx.scrollRef?.current;
+    if (!el) return;
+    // Restore the incoming conversation's saved view (written live by
+    // VirtualBubbleList); no saved view (first visit) → bottom. Bottom is a
+    // moving target — the virtualizer measures rows after mount, so the height
+    // grows over the next few frames. A ResizeObserver on the content re-applies
+    // the target on each growth (pre-paint), holding it through the settle
+    // without polling; it's inert once the height stops changing and is torn
+    // down on the next switch.
+    ctx.stopScroll();
+    const saved = conversationId ? transcriptViewCache.get(conversationId) : undefined;
+    const toBottom = !saved || saved.atBottom;
+    const apply = () => {
+      el.scrollTop = toBottom ? Math.max(0, el.scrollHeight - el.clientHeight) : saved.offset;
+    };
+    apply();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(apply);
+    observer.observe(el.firstElementChild ?? el); // the content, which grows as rows measure
+    return () => observer.disconnect();
+  }, [conversationId, ctx]);
+  return null;
+}
+
 function VirtualBubbleList({
   bubbles,
   scrollEl,
   lastAssistantIndex,
   showsWorking,
+  conversationKey,
   onGeometryChange,
 }: {
   bubbles: Bubble[];
   scrollEl: HTMLElement | null;
   lastAssistantIndex: number;
   showsWorking: boolean;
+  /** Deferred conversation id; used to gate the scroll save so a transitional
+   *  scroll during a switch (deferred key still lagging) can't corrupt a
+   *  conversation's saved view. */
+  conversationKey: string | null | undefined;
   /** Publishes virtualizer-derived geometry up to the rail/spacer. */
   onGeometryChange: (geometry: TranscriptGeometry) => void;
 }) {
+  // Save this conversation's live scroll view (real scrollTop + at-bottom flag)
+  // as the reader scrolls, so a later return restores it. Keyed by the store's
+  // conversationId (leads the deferred key), and gated on the deferred key
+  // having caught up (store id === deferred key) so a scroll fired mid-switch —
+  // when the shared element is transitioning between conversations — can't be
+  // attributed to the wrong one.
+  const storeConvId = useChatStore((s) => s.conversationId);
+  useEffect(() => {
+    if (!scrollEl || !storeConvId) return;
+    const save = () => {
+      if (storeConvId !== conversationKey) return; // a switch is in flight
+      rememberTranscriptView(storeConvId, {
+        atBottom: isElAtBottom(scrollEl),
+        offset: Math.round(scrollEl.scrollTop),
+      });
+    };
+    save();
+    scrollEl.addEventListener("scroll", save, { passive: true });
+    return () => scrollEl.removeEventListener("scroll", save);
+  }, [scrollEl, storeConvId, conversationKey]);
+
   const wrapperRef = useRef<HTMLDivElement>(null);
   // The list isn't the scroll container's first child — indicators, padding,
   // and the task tracker sit above it — so its top offset feeds the virtualizer
@@ -479,6 +580,7 @@ function VirtualBubbleList({
     virtualizerRef.current.scrollToIndex(index, { align: "center" });
     return true;
   }, []);
+
 
   const totalSize = virtualizer.getTotalSize();
   const range = virtualizer.range;
