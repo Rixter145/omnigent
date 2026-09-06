@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import shutil
 import signal
@@ -39,10 +40,14 @@ import pytest
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses.process_manager import (
     _AP_PID_FILE,
+    _HARNESS_CLAUDE_SDK_SUBSCRIPTION_ISOLATION_ENV,
+    _HARNESS_SUBSCRIPTION_AUTH_ENV,
     _TMP_PARENT_ENV_VAR,
     HarnessProcessManager,
     NoLiveHarnessError,
+    _build_harness_spawn_env,
     _default_tmp_parent,
+    _launch_identity,
     _model_env_key,
     _pid_alive,
     _pids_holding_socket,
@@ -245,6 +250,56 @@ async def _ping_health(client) -> None:  # type: ignore[no-untyped-def]
     assert response.json() == {"status": "ok"}
 
 
+async def _assert_entry_live(manager: HarnessProcessManager, conversation_id: str):  # type: ignore[no-untyped-def]
+    """Assert the registered harness is alive through its selected transport."""
+    entry = manager._entries[conversation_id]
+    assert entry.process.returncode is None
+    if entry.endpoint.is_uds:
+        assert entry.endpoint.socket_path is not None
+        assert entry.endpoint.socket_path.exists()
+    else:
+        assert await entry.endpoint.can_connect()
+    return entry
+
+
+async def _wait_for_entry_release(
+    manager: HarnessProcessManager,
+    conversation_id: str,
+    entry,  # type: ignore[no-untyped-def]
+) -> None:
+    """Wait until release/reaping removes the registry entry and endpoint."""
+    for _ in range(60):
+        if entry.endpoint.is_uds:
+            assert entry.endpoint.socket_path is not None
+            endpoint_released = not entry.endpoint.socket_path.exists()
+        else:
+            endpoint_released = not await entry.endpoint.can_connect()
+        if conversation_id not in manager._entries and endpoint_released:
+            return
+        await asyncio.sleep(0.1)
+
+    assert conversation_id not in manager._entries
+    if entry.endpoint.is_uds:
+        assert entry.endpoint.socket_path is not None
+        assert not entry.endpoint.socket_path.exists()
+    else:
+        assert not await entry.endpoint.can_connect()
+
+
+def _assert_spawn_release_complete(
+    manager: HarnessProcessManager,
+    conversation_id: str,
+    process: asyncio.subprocess.Process,
+) -> None:
+    """Assert a mid-spawn release removed all observable process state."""
+    assert not manager.has_session(conversation_id)
+    assert conversation_id not in manager._entries
+    if sys.platform == "win32":
+        assert process.returncode is not None
+    else:
+        assert not (manager.instance_dir / f"conv-{conversation_id}.sock").exists()
+
+
 async def test_get_client_spawns_and_serves(
     manager: HarnessProcessManager,
 ) -> None:
@@ -334,13 +389,11 @@ async def test_release_terminates_subprocess(
         # Capture the subprocess PID via the introspection endpoint;
         # if release worked, the PID won't be alive after.
         pid = (await client.get("/pid")).json()["pid"]
-        socket_path = manager.instance_dir / "conv-conv_a.sock"
-        assert socket_path.exists()
+        entry = await _assert_entry_live(manager, "conv_a")
         await manager.release("conv_a")
-        # Socket cleanup is part of release's contract — leaving
-        # the file behind would fail uvicorn binding on a
-        # subsequent spawn for the same conv id.
-        assert not socket_path.exists()
+        # Endpoint cleanup is part of release's contract — leaving a UDS file
+        # or TCP listener behind would prevent a later spawn for this conv id.
+        await _wait_for_entry_release(manager, "conv_a", entry)
         # Process should be gone — give the OS a brief moment
         # since SIGTERM → wait is async.
         for _ in range(20):
@@ -404,7 +457,9 @@ async def test_get_client_respawns_after_crash(
     try:
         client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
         original_pid = (await client.get("/pid")).json()["pid"]
-        os.kill(original_pid, signal.SIGKILL)
+        process = manager._entries["conv_a"].process
+        process.kill()
+        await process.wait()
         # Wait for the OS to mark the process dead so the next
         # get_client's ``returncode`` check sees it.
         for _ in range(40):
@@ -509,6 +564,109 @@ async def test_get_client_respawns_on_model_change(
                 break
             await asyncio.sleep(0.05)
         assert not _pid_alive(pid_first)
+    finally:
+        await manager.shutdown()
+
+
+async def test_tcp_readiness_handoff_rejects_racing_listener_before_port_assignment() -> None:
+    """A local peer without the child bearer cannot nominate the client endpoint."""
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    token = "child-only-bearer"
+    conversation_id = "conv_ready"
+    handoff = await pm_mod._TcpReadyHandoff.create(token, conversation_id)
+
+    class Process:
+        pid = os.getpid()
+        returncode: int | None = None
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            return self.returncode or 0
+
+    process = Process()
+
+    async def send(payload: dict[str, object]) -> bytes:
+        host, raw_port = handoff.endpoint.rsplit(":", 1)
+        reader, writer = await asyncio.open_connection(host, int(raw_port))
+        writer.write(json.dumps(payload).encode() + b"\n")
+        await writer.drain()
+        result = await reader.readline()
+        writer.close()
+        await writer.wait_closed()
+        return result
+
+    try:
+        # This models the process that previously won the released-port race:
+        # it can connect to the parent but cannot authenticate a port handoff.
+        assert (
+            await send(
+                {
+                    "conversation_id": conversation_id,
+                    "pid": os.getpid(),
+                    "port": 45678,
+                    "token": "racing-listener-token",
+                }
+            )
+            == b"rejected\n"
+        )
+
+        ready = asyncio.create_task(handoff.wait_for_port(process, "test", conversation_id))
+        await asyncio.sleep(0)
+        assert not ready.done()
+
+        assert (
+            await send(
+                {
+                    "conversation_id": conversation_id,
+                    "pid": os.getpid(),
+                    "port": 45679,
+                    "token": token,
+                }
+            )
+            == b"ok\n"
+        )
+        assert await ready == 45679
+
+        # A repeated child report cannot replace the endpoint after readiness.
+        assert (
+            await send(
+                {
+                    "conversation_id": conversation_id,
+                    "pid": os.getpid(),
+                    "port": 45680,
+                    "token": token,
+                }
+            )
+            == b"ok\n"
+        )
+        assert await handoff.wait_for_port(process, "test", conversation_id) == 45679
+    finally:
+        await handoff.aclose()
+
+
+async def test_get_client_respawns_when_model_returns_to_provider_default(
+    manager: HarnessProcessManager,
+) -> None:
+    """An omitted transport model replaces a cached concrete-model process once."""
+    model_key = _model_env_key(_TEST_HARNESS_NAME)
+    await manager.start()
+    try:
+        concrete_client = await manager.get_client(
+            "conv_a", _TEST_HARNESS_NAME, env={model_key: "model-a"}
+        )
+        concrete_pid = (await concrete_client.get("/pid")).json()["pid"]
+
+        default_client = await manager.get_client("conv_a", _TEST_HARNESS_NAME, env={})
+        default_pid = (await default_client.get("/pid")).json()["pid"]
+        assert default_pid != concrete_pid
+        assert manager._entries["conv_a"].model is None
+
+        same_default_client = await manager.get_client("conv_a", _TEST_HARNESS_NAME, env={})
+        assert same_default_client is default_client
+        assert (await same_default_client.get("/pid")).json()["pid"] == default_pid
     finally:
         await manager.shutdown()
 
@@ -625,6 +783,149 @@ async def test_get_client_seeds_model_and_reuses_without_respawn(
         await manager.shutdown()
 
 
+async def test_get_client_respawns_for_subscription_transport_without_storing_credentials(
+    manager: HarnessProcessManager,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A routed subscription replaces a pre-route gateway process exactly once."""
+    source_secret = "sk-source-must-not-appear-in-cache-or-logs"
+    source_env = {
+        "HARNESS_CLAUDE_SDK_GATEWAY": "true",
+        "HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL": f"https://user:{source_secret}@metered.invalid/v1",
+        "HARNESS_CLAUDE_SDK_API_KEY_HELPER": f"printf %s {source_secret}",
+    }
+    subscription_env = {_HARNESS_SUBSCRIPTION_AUTH_ENV: "claude-sdk"}
+
+    await manager.start()
+    try:
+        # Session creation can eagerly launch this pre-route process.
+        client_first = await manager.get_client("conv_a", _TEST_HARNESS_NAME, env=source_env)
+        pid_first = (await client_first.get("/pid")).json()["pid"]
+
+        # The first routed subscription turn must replace it before dispatch.
+        client_subscription = await manager.get_client(
+            "conv_a", _TEST_HARNESS_NAME, env=subscription_env
+        )
+        pid_subscription = (await client_subscription.get("/pid")).json()["pid"]
+        assert pid_subscription != pid_first
+
+        entry = manager._entries["conv_a"]
+        assert source_secret not in repr(entry.launch_identity)
+        assert source_secret not in caplog.text
+
+        # The same effective subscription contract reuses the replacement.
+        client_same_subscription = await manager.get_client(
+            "conv_a", _TEST_HARNESS_NAME, env=subscription_env
+        )
+        assert client_same_subscription is client_subscription
+        assert (await client_same_subscription.get("/pid")).json()["pid"] == pid_subscription
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("key", "marker", "first", "second"),
+    [
+        ("CLAUDE_CODE_OAUTH_TOKEN", "claude-sdk", "oauth-token-alpha", "oauth-token-beta"),
+        ("CODEX_HOME", "codex", "/private/codex-home-alpha", "/private/codex-home-beta"),
+    ],
+)
+async def test_get_client_respawns_for_subscription_auth_rotation_without_storing_values(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    key: str,
+    marker: str,
+    first: str,
+    second: str,
+) -> None:
+    """Selected subscription login changes replace only the cached process."""
+    subscription_env = {_HARNESS_SUBSCRIPTION_AUTH_ENV: marker}
+    monkeypatch.setenv(key, first)
+
+    await manager.start()
+    try:
+        first_client = await manager.get_client("conv_a", _TEST_HARNESS_NAME, env=subscription_env)
+        first_pid = (await first_client.get("/pid")).json()["pid"]
+        first_identity = manager._entries["conv_a"].launch_identity
+
+        same_client = await manager.get_client("conv_a", _TEST_HARNESS_NAME, env=subscription_env)
+        assert same_client is first_client
+        assert (await same_client.get("/pid")).json()["pid"] == first_pid
+
+        monkeypatch.setenv(key, second)
+        second_client = await manager.get_client(
+            "conv_a", _TEST_HARNESS_NAME, env=subscription_env
+        )
+        second_pid = (await second_client.get("/pid")).json()["pid"]
+        second_identity = manager._entries["conv_a"].launch_identity
+        assert second_pid != first_pid
+        assert second_identity != first_identity
+
+        identity = dict(second_identity)
+        assert identity[key].startswith("<fingerprint:")
+        identity_text = f"{first_identity!r} {second_identity!r}"
+        for sensitive_value in (first, second):
+            assert sensitive_value not in identity_text
+            assert sensitive_value not in caplog.text
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("key", "first", "second"),
+    [
+        ("HARNESS_CODEX_API_KEY", "api-key-alpha", "api-key-beta"),
+        ("HARNESS_CODEX_API_KEY_HELPER", "printf %s helper-alpha", "printf %s helper-beta"),
+        (
+            "HARNESS_CODEX_GATEWAY_AUTH_COMMAND",
+            "printf %s command-alpha",
+            "printf %s command-beta",
+        ),
+    ],
+)
+async def test_get_client_respawns_for_rotated_auth_without_retaining_values(
+    manager: HarnessProcessManager,
+    caplog: pytest.LogCaptureFixture,
+    key: str,
+    first: str,
+    second: str,
+) -> None:
+    """A changed auth contract replaces the child; an identical one reuses it."""
+    url_secret = "url-secret-must-not-appear"
+    common = {
+        "HARNESS_CODEX_GATEWAY": "true",
+        "HARNESS_CODEX_GATEWAY_BASE_URL": (
+            f"https://user:{url_secret}@metered.invalid/path/{url_secret}?token={url_secret}"
+        ),
+    }
+    first_env = {**common, key: first}
+    second_env = {**common, key: second}
+
+    await manager.start()
+    try:
+        first_client = await manager.get_client("conv_a", _TEST_HARNESS_NAME, env=first_env)
+        first_pid = (await first_client.get("/pid")).json()["pid"]
+        first_identity = manager._entries["conv_a"].launch_identity
+
+        same_client = await manager.get_client("conv_a", _TEST_HARNESS_NAME, env=first_env)
+        assert same_client is first_client
+        assert (await same_client.get("/pid")).json()["pid"] == first_pid
+
+        second_client = await manager.get_client("conv_a", _TEST_HARNESS_NAME, env=second_env)
+        second_pid = (await second_client.get("/pid")).json()["pid"]
+        second_identity = manager._entries["conv_a"].launch_identity
+        assert second_pid != first_pid
+        assert second_identity != first_identity
+
+        identity_text = repr(second_identity)
+        for sensitive_value in (first, second, url_secret):
+            assert sensitive_value not in identity_text
+            assert sensitive_value not in caplog.text
+    finally:
+        await manager.shutdown()
+
+
 # ── Idle reaping ───────────────────────────────────────────────
 
 
@@ -638,7 +939,7 @@ async def test_idle_reaper_releases_stale_entries(
     test completes promptly without letting the reaper kill the
     subprocess before the setup health probe has completed. After
     reaping, the conversation is no longer registered and its
-    socket file is gone.
+    transport endpoint is unavailable.
     """
     fast = HarnessProcessManager(
         idle_timeout_s=2.0,
@@ -649,22 +950,18 @@ async def test_idle_reaper_releases_stale_entries(
     try:
         await fast.get_client("conv_a", _TEST_HARNESS_NAME)
         # No HTTP ping: with idle_timeout_s=0.0 the reaper can fire during an
-        # inline HTTP call and yank the client mid-request. Socket-existence
-        # loop below is the real "entry was reaped" assertion.
-        socket_path = fast.instance_dir / "conv-conv_a.sock"
-        assert socket_path.exists()
+        # inline HTTP call and yank the client mid-request. The endpoint wait
+        # below is the real "entry was reaped" assertion.
+        entry = await _assert_entry_live(fast, "conv_a")
         # Wait long enough for the 2s idle window plus multiple
         # reaper passes. A 0s timeout races with subprocess startup
         # under CI load and can close the client before the socket is
         # ready to service requests.
-        for _ in range(60):
-            if not socket_path.exists():
-                break
-            await asyncio.sleep(0.1)
+        await _wait_for_entry_release(fast, "conv_a", entry)
         # If this assertion flips, the reaper isn't running OR
         # isn't acting on stale entries — both regressions in
         # the contract.
-        assert not socket_path.exists()
+        assert "conv_a" not in fast._entries
     finally:
         await fast.shutdown()
 
@@ -687,7 +984,7 @@ async def test_idle_reaper_survives_release_error(
 
     Inject a one-shot ``release`` failure on the first reaper-triggered
     call and assert the loop keeps going: the still-stale entry is reaped
-    on a later pass. Before the fix the socket never disappears (the loop
+    on a later pass. Before the fix the endpoint remained live (the loop
     died); after it, a subsequent pass reclaims it.
     """
     fast = HarnessProcessManager(
@@ -698,8 +995,7 @@ async def test_idle_reaper_survives_release_error(
     await fast.start()
     try:
         await fast.get_client("conv_a", _TEST_HARNESS_NAME)
-        socket_path = fast.instance_dir / "conv-conv_a.sock"
-        assert socket_path.exists()
+        entry = await _assert_entry_live(fast, "conv_a")
 
         # Make the first reaper-triggered release raise, then defer to the
         # real release on later calls — a transient teardown failure.
@@ -715,13 +1011,10 @@ async def test_idle_reaper_survives_release_error(
         monkeypatch.setattr(fast, "release", flaky_release)
 
         # Across many reaper passes: with the bug the first raise kills the
-        # loop and the socket lingers; with the guard a later pass reaps it.
-        for _ in range(60):
-            if not socket_path.exists():
-                break
-            await asyncio.sleep(0.1)
+        # loop and the endpoint stays live; with the guard a later pass reaps it.
+        await _wait_for_entry_release(fast, "conv_a", entry)
         assert calls["n"] >= 1, "reaper never attempted to release the stale entry"
-        assert not socket_path.exists(), (
+        assert "conv_a" not in fast._entries, (
             "reaper died on the first release error and never reclaimed the "
             "stale subprocess on a later pass"
         )
@@ -756,8 +1049,7 @@ async def test_idle_reaper_skips_in_flight_turn(
     await fast.start()
     try:
         await fast.get_client("conv_a", _TEST_HARNESS_NAME)
-        socket_path = fast.instance_dir / "conv-conv_a.sock"
-        assert socket_path.exists()
+        entry = await _assert_entry_live(fast, "conv_a")
         # Mark the turn live, as the runner does on ``response.created``.
         fast.mark_in_flight("conv_a", "resp_x")
         assert fast.has_active_turn("conv_a")
@@ -766,16 +1058,12 @@ async def test_idle_reaper_skips_in_flight_turn(
         # in-flight guard must keep the subprocess alive the whole time.
         for _ in range(40):
             await asyncio.sleep(0.1)
-            assert socket_path.exists(), "in-flight turn was reaped mid-flight"
+            await _assert_entry_live(fast, "conv_a")
         # Turn ends: clear the marker (as ``_on_proxy_stream_end`` does). The
         # entry is now genuinely idle and must become reapable.
         fast.clear_in_flight("conv_a")
         assert not fast.has_active_turn("conv_a")
-        for _ in range(60):
-            if not socket_path.exists():
-                break
-            await asyncio.sleep(0.1)
-        assert not socket_path.exists()
+        await _wait_for_entry_release(fast, "conv_a", entry)
     finally:
         await fast.shutdown()
 
@@ -936,12 +1224,12 @@ async def test_idle_reaper_disabled_when_timeout_zero(
     await fast.start()
     try:
         await fast.get_client("conv_a", _TEST_HARNESS_NAME)
-        socket_path = fast.instance_dir / "conv-conv_a.sock"
-        assert socket_path.exists()
-        # ~20 reaper passes at 0.05 s. With the bug the socket is gone almost
+        await _assert_entry_live(fast, "conv_a")
+        # ~20 reaper passes at 0.05 s. With the bug the endpoint is gone almost
         # immediately; with the guard it survives because reaping is disabled.
         await asyncio.sleep(1.0)
-        assert socket_path.exists(), (
+        await _assert_entry_live(fast, "conv_a")
+        assert fast.has_session("conv_a"), (
             "idle_timeout_s=0 must DISABLE reaping, not reap every entry each pass"
         )
     finally:
@@ -1059,6 +1347,22 @@ async def test_pids_holding_socket_returns_empty_when_lsof_is_missing(
 
 
 # ── Per-spawn env override ─────────────────────────────────────
+
+
+def test_claude_subscription_marker_becomes_internal_isolation_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The private marker is consumed and becomes only Claude's safe bridge."""
+    monkeypatch.setenv("HARNESS_CLAUDE_SDK_GATEWAY", "true")
+
+    subscription_env = _build_harness_spawn_env({_HARNESS_SUBSCRIPTION_AUTH_ENV: "claude-sdk"})
+    ordinary_env = _build_harness_spawn_env({})
+
+    assert _HARNESS_SUBSCRIPTION_AUTH_ENV not in subscription_env
+    assert subscription_env[_HARNESS_CLAUDE_SDK_SUBSCRIPTION_ISOLATION_ENV] == "1"
+    assert "HARNESS_CLAUDE_SDK_GATEWAY" not in subscription_env
+    assert _HARNESS_CLAUDE_SDK_SUBSCRIPTION_ISOLATION_ENV not in ordinary_env
+    assert _launch_identity({_HARNESS_SUBSCRIPTION_AUTH_ENV: "claude-sdk"}) != _launch_identity({})
 
 
 async def test_get_client_env_override_propagates_to_subprocess(
@@ -1273,7 +1577,10 @@ async def test_orphan_sweep_escalates_to_sigkill(
     await mgr._kill_orphan_runners(instance_dir)
 
     assert calls == 2
-    assert killed == [(12345, signal.SIGTERM), (12345, signal.SIGKILL)]
+    assert killed == [
+        (12345, signal.SIGTERM),
+        (12345, getattr(signal, "SIGKILL", signal.SIGTERM)),
+    ]
 
 
 # ── Mid-spawn cancellation ──────────────────────────────────────
@@ -1465,10 +1772,7 @@ async def test_release_during_spawn_leaves_no_live_process(
         assert client is not None
         assert await release_task is None
 
-        socket_path = manager.instance_dir / f"conv-{conv_id}.sock"
-        assert not manager.has_session(conv_id)
-        assert conv_id not in manager._entries
-        assert not socket_path.exists()
+        _assert_spawn_release_complete(manager, conv_id, process)
         for _ in range(40):
             if not _pid_alive(pid):
                 break
@@ -1612,7 +1916,6 @@ async def test_shutdown_during_spawn_leaves_no_live_process(
         assert spawned, "spawn was never reached"
         process = spawned[0]
         pid = process.pid
-        socket_path = manager.instance_dir / f"conv-{conv_id}.sock"
 
         shutdown_task = asyncio.create_task(manager.shutdown())
         await asyncio.sleep(0)
@@ -1629,9 +1932,7 @@ async def test_shutdown_during_spawn_leaves_no_live_process(
         assert "shutdown" in str(exc).lower()
         assert await shutdown_task is None
 
-        assert not manager.has_session(conv_id)
-        assert conv_id not in manager._entries
-        assert not socket_path.exists()
+        _assert_spawn_release_complete(manager, conv_id, process)
         for _ in range(40):
             if not _pid_alive(pid):
                 break

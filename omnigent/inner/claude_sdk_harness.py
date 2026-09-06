@@ -124,6 +124,8 @@ _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH
 # executor strips ANTHROPIC_API_KEY before connecting to avoid subscription
 # auth being bypassed).
 _ENV_API_KEY_HELPER = "HARNESS_CLAUDE_SDK_API_KEY_HELPER"
+# Non-secret process-manager bridge for subscription-routed Claude only.
+_ENV_SUBSCRIPTION_ISOLATION = "HARNESS_CLAUDE_SDK_SUBSCRIPTION_ISOLATION"
 
 # Default permission mode for the Claude SDK. ``"auto"`` auto-approves
 # tool calls with background safety checks that verify actions align
@@ -267,6 +269,11 @@ def _build_claude_sdk_executor() -> Executor:
     """
     gateway_raw = os.environ.get(_ENV_GATEWAY, "").strip().lower()
     gateway = gateway_raw in ("1", "true", "yes")
+    subscription_isolation = os.environ.get(_ENV_SUBSCRIPTION_ISOLATION, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     bundle_dir_raw = os.environ.get(_ENV_BUNDLE_DIR, "").strip()
     bundle_dir = Path(bundle_dir_raw) if bundle_dir_raw else None
     agent_name_raw = os.environ.get(_ENV_AGENT_NAME, "").strip()
@@ -296,6 +303,7 @@ def _build_claude_sdk_executor() -> Executor:
         agent_name=agent_name,
         skills_filter=_resolve_skills_filter(),
         api_key_helper=os.environ.get(_ENV_API_KEY_HELPER) or None,
+        subscription_isolation=subscription_isolation,
     )
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -456,10 +457,16 @@ def test_start_local_server_spawns_runner_as_sibling(
         env: dict[str, str],
         stdout: object,
         stderr: object,
-        start_new_session: bool,
+        start_new_session: bool | None = None,
+        creationflags: int | None = None,
     ) -> _Proc:
         """Record the server subprocess command."""
-        assert start_new_session is True
+        if os.name == "nt":
+            assert creationflags
+            assert start_new_session is None
+        else:
+            assert start_new_session is True
+            assert creationflags is None
         proc = _Proc(args=args, env=env, stdout=stdout, stderr=stderr)
         server_popen_calls.append(proc)
         return proc
@@ -2298,10 +2305,11 @@ def test_materialize_directory_bundle_with_override_keeps_nested_harness_unpinne
         (
             "polly",
             {
-                "claude_code": "claude-native",
-                "codex": "codex-native",
+                "subscription_worker": "claude-sdk",
+                "claude_code": "claude-sdk",
+                "codex": "codex",
                 "opencode": "opencode-native",
-                "cursor": "cursor-native",
+                "cursor": "cursor-wsl",
                 "hermes": "hermes-native",
                 "pi": "pi",
                 "agy": "antigravity-native",

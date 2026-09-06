@@ -669,6 +669,18 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         streaming=True,
         instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
+    "cursor-wsl": _C(
+        _IM.CLI_SUBPROCESS,
+        _EL.NONE,
+        _RS.COLD_ONLY,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=False,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
+    ),
 }
 
 # Builtin ACP CLI harnesses (omnigent/acp_cli_harnesses.py) run through the
@@ -699,6 +711,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "codex-native",
             "copilot",
             "cursor",
+            "cursor-wsl",
             "cursor-native",
             "goose",
             "goose-native",
@@ -734,6 +747,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "codex-native": "omnigent.inner.codex_native_harness",
         "copilot": "omnigent.inner.copilot_harness",
         "cursor": "omnigent.inner.cursor_harness",
+        "cursor-wsl": "omnigent.inner.cursor_wsl_harness",
         "cursor-native": "omnigent.inner.cursor_native_harness",
         "goose": "omnigent.inner.goose_harness",
         "goose-native": "omnigent.inner.goose_native_harness",
@@ -827,6 +841,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "codex": "HARNESS_CODEX_MODEL",
         "copilot": "HARNESS_COPILOT_MODEL",
         "cursor": "HARNESS_CURSOR_MODEL",
+        "cursor-wsl": "HARNESS_CURSOR_WSL_MODEL",
         "goose": "HARNESS_GOOSE_MODEL",
         "hermes": "HARNESS_HERMES_MODEL",
         "kimi": "HARNESS_KIMI_MODEL",
@@ -855,6 +870,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "codex": "Codex",
         "copilot": "Copilot",
         "cursor": "Cursor",
+        "cursor-wsl": "Cursor WSL",
         "hermes": "Hermes",
         # openai-agents is intentionally omitted from the picker catalog: it
         # stays a valid harness for YAML specs (and the credential-free

@@ -314,11 +314,12 @@ class TurnRouteDecision:
     :param decision_id: Identity shared by the response and the chip.
     """
 
-    action: Literal["route", "allow"]
+    action: Literal["route", "allow", "deny"]
     rationale: str
     model: str | None = None
     terminal: bool = False
     decision_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    receipt: dict[str, Any] | None = None
 
     def to_payload(self) -> dict[str, Any]:
         """Serialize to the response shape the hook reads.
@@ -331,6 +332,7 @@ class TurnRouteDecision:
             "rationale": self.rationale,
             "terminal": self.terminal,
             "decision_id": self.decision_id,
+            "receipt": self.receipt,
         }
 
     @classmethod
@@ -344,7 +346,9 @@ class TurnRouteDecision:
         """
         action = payload.get("action")
         model = _opt_str(payload.get("model"))
-        if action != "route" or model is None:
+        if action == "deny":
+            model = None
+        elif action != "route" or model is None:
             action = "allow"
         rationale = payload.get("rationale")
         decision_id = payload.get("decision_id")
@@ -354,6 +358,7 @@ class TurnRouteDecision:
             model=model,
             terminal=bool(payload.get("terminal")),
             decision_id=decision_id if isinstance(decision_id, str) else str(uuid.uuid4()),
+            receipt=payload.get("receipt") if isinstance(payload.get("receipt"), dict) else None,
         )
 
 
@@ -573,6 +578,7 @@ async def resolve_turn_route(
     reuse_create_route: Callable[[], Awaitable[bool]] | None = None,
     pin: Callable[[str], Awaitable[bool]] | None = None,
     persist: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
+    commit_required: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
     record_decline: Callable[[str], Awaitable[None]] | None = None,
 ) -> TurnRouteDecision:
     """Decide what happens to one submitted prompt.
@@ -601,6 +607,10 @@ async def resolve_turn_route(
         skips the pin (unit tests).
     :param persist: Coroutine recording the decision chip, called as
         ``persist(model, verdict)``. ``None`` skips persistence.
+    :param commit_required: Coroutine atomically pinning the model, receipt,
+        and route-once label for a required decision. When provided, required
+        routing uses this instead of the separate ``pin`` and ``persist``
+        callbacks so a failed commit leaves the turn retryable.
     :param record_decline: Coroutine persisting a declined chip when a
         routing CALL failed, called with the cause. Only the failure
         branches use it — the benign allows (already routed, routing off,
@@ -654,6 +664,14 @@ async def resolve_turn_route(
     try:
         model, verdict = await route_turn(req.harness, req.prompt[:_PROMPT_CAP])
     except Exception as exc:  # noqa: BLE001 — a router outage must never block a turn
+        from omnigent.server.smart_routing import RequiredRoutingUnavailable
+
+        if isinstance(exc, RequiredRoutingUnavailable):
+            reason = (
+                f"Required subscription routing is unavailable; the turn was denied. {exc.reason}"
+            )
+            await _record_turn_decline(record_decline, reason, session_id)
+            return TurnRouteDecision(action="deny", rationale=reason, terminal=True)
         _logger.warning(
             "route-turn: router call failed for session=%s; allowing unrouted",
             session_id,
@@ -664,6 +682,15 @@ async def resolve_turn_route(
         )
         return _allow("routing unavailable (router call failed)")
     if not model or verdict is None:
+        from omnigent.server.smart_routing import routing_required
+
+        if routing_required():
+            reason = (
+                "Required subscription routing is unavailable; the turn was denied. "
+                "The router returned no validated route."
+            )
+            await _record_turn_decline(record_decline, reason, session_id)
+            return TurnRouteDecision(action="deny", rationale=reason, terminal=True)
         _logger.info(
             "route-turn: no verdict for session=%s harness=%s; allowing unrouted",
             session_id,
@@ -673,6 +700,8 @@ async def resolve_turn_route(
             record_decline, "Routing unavailable (router returned no verdict)", session_id
         )
         return _allow("routing unavailable (no verdict)")
+    if req.model and isinstance(verdict.get("receipt"), dict):
+        verdict["receipt"] = {**verdict["receipt"], "user_override": req.model}
     # Spelling-insensitive: codex reports its live model as a dotted slug
     # (``gpt-5.6-luna``) where the catalog writes dashes and a prefix
     # (``databricks-gpt-5-6-luna``), and claude reports whatever the picker
@@ -688,14 +717,46 @@ async def resolve_turn_route(
 
     # Both verdicts pin and record: the decision row and the label are what
     # the route-once gate reads, so a no-op that skipped them would re-route
-    # on the next prompt.
-    if pin is not None and not await pin(model):
-        return _allow("routing unavailable (could not pin the routed model)")
-    if persist is not None:
+    # on the next prompt. Required routing commits all three writes in one
+    # store transaction; advisory routing retains the legacy two-callback path.
+    from omnigent.server.smart_routing import routing_required
+
+    required = verdict.get("routing_required") is True or routing_required()
+    if required and commit_required is not None:
         try:
-            await persist(model, verdict)
+            await commit_required(model, verdict)
         except Exception:
-            _logger.exception("route-turn: decision persist failed for session=%s", session_id)
+            _logger.exception(
+                "route-turn: atomic decision commit failed for session=%s", session_id
+            )
+            reason = (
+                "Required subscription routing could not atomically pin and record "
+                "the validated route; the turn was denied."
+            )
+            await _record_turn_decline(record_decline, reason, session_id)
+            return TurnRouteDecision(action="deny", rationale=reason, terminal=True)
+    else:
+        if pin is not None and not await pin(model):
+            if required:
+                reason = (
+                    "Required subscription routing could not pin the validated route; "
+                    "the turn was denied."
+                )
+                await _record_turn_decline(record_decline, reason, session_id)
+                return TurnRouteDecision(action="deny", rationale=reason, terminal=True)
+            return _allow("routing unavailable (could not pin the routed model)")
+        if persist is not None:
+            try:
+                await persist(model, verdict)
+            except Exception:
+                _logger.exception("route-turn: decision persist failed for session=%s", session_id)
+                if required:
+                    reason = (
+                        "Required subscription routing could not durably record its "
+                        "decision receipt; the turn was denied."
+                    )
+                    await _record_turn_decline(record_decline, reason, session_id)
+                    return TurnRouteDecision(action="deny", rationale=reason, terminal=True)
     rationale = verdict.get("rationale")
     return TurnRouteDecision(
         # A no-op verdict must be terminal AND unblocking: there is nothing to
@@ -704,6 +765,7 @@ async def resolve_turn_route(
         rationale=rationale if isinstance(rationale, str) and rationale else f"Routed to {model}",
         model=model,
         terminal=True,
+        receipt=verdict.get("receipt") if isinstance(verdict.get("receipt"), dict) else None,
     )
 
 

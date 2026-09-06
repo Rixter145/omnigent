@@ -18,6 +18,7 @@ from omnigent.entities import (
     MessageData,
     NewConversationItem,
     ReasoningData,
+    RoutingDecisionData,
 )
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.session_import import (
@@ -460,6 +461,217 @@ def test_update_archived_bumps_updated_at(
 # ── Append & list items ──────────────────────────────
 
 
+def _required_routing_item(
+    response_id: str = "routing_atomic",
+    *,
+    decision_id: str = "decision-atomic",
+) -> NewConversationItem:
+    """Build the validated receipt used by atomic routing-store tests."""
+    return NewConversationItem(
+        type="routing_decision",
+        response_id=response_id,
+        data=RoutingDecisionData(
+            model="gpt-subscription-default",
+            applied=True,
+            rationale="validated subscription route",
+            decision_id=decision_id,
+            receipt={"selection_mode": "deterministic"},
+        ),
+    )
+
+
+def _assert_required_route_absent(
+    store: SqlAlchemyConversationStore,
+    conversation_id: str,
+) -> None:
+    """Assert a failed atomic commit exposed none of its three writes."""
+    conv = store.get_conversation(conversation_id)
+    assert conv is not None
+    assert conv.model_override is None
+    assert conv.harness_override == "auto"
+    assert "test.routing.decision" not in conv.labels
+    routing_items = [
+        item for item in store.list_items(conversation_id).data if item.type == "routing_decision"
+    ]
+    assert routing_items == []
+    assert store.search("validated", conversation_id=conversation_id) == []
+
+
+def _assert_required_route_committed(
+    store: SqlAlchemyConversationStore,
+    conversation_id: str,
+) -> None:
+    """Assert the model pin, receipt, and route-once marker committed together."""
+    conv = store.get_conversation(conversation_id)
+    assert conv is not None
+    assert conv.model_override == "gpt-subscription-default"
+    assert conv.harness_override is None
+    assert conv.labels["test.routing.decision"] == "decision-atomic"
+    receipts = [
+        item for item in store.list_items(conversation_id).data if item.type == "routing_decision"
+    ]
+    assert len(receipts) == 1
+    assert receipts[0].data.decision_id == "decision-atomic"
+    indexed = store.search("validated", conversation_id=conversation_id)
+    assert [item.id for item in indexed] == [receipts[0].id]
+
+
+def test_required_routing_receipt_insert_failure_rolls_back_pin_and_label(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A receipt insert error leaves a required route fully retryable."""
+    conv = conversation_store.create_conversation()
+    conversation_store.update_conversation(conv.id, harness_override="auto")
+
+    def _fail_receipt(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if "insert into conversation_items" in statement.lower():
+            raise OSError("injected receipt failure")
+
+    event.listen(conversation_store._conv_engine, "before_cursor_execute", _fail_receipt)
+    try:
+        with pytest.raises(OSError, match="injected receipt failure"):
+            conversation_store.commit_routing_decision(
+                conv.id,
+                _required_routing_item(),
+                decision_label_key="test.routing.decision",
+                decision_id="decision-atomic",
+                model_override="gpt-subscription-default",
+                unset_harness_override=True,
+            )
+    finally:
+        event.remove(conversation_store._conv_engine, "before_cursor_execute", _fail_receipt)
+
+    _assert_required_route_absent(conversation_store, conv.id)
+    conversation_store.commit_routing_decision(
+        conv.id,
+        _required_routing_item(),
+        decision_label_key="test.routing.decision",
+        decision_id="decision-atomic",
+        model_override="gpt-subscription-default",
+        unset_harness_override=True,
+    )
+    _assert_required_route_committed(conversation_store, conv.id)
+
+
+def test_required_routing_label_failure_rolls_back_pin_and_receipt(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A route-label error rolls back the earlier pin and receipt insert."""
+    from omnigent.stores.conversation_store import sqlalchemy_store as store_module
+
+    conv = conversation_store.create_conversation()
+    conversation_store.update_conversation(conv.id, harness_override="auto")
+    real_upsert = store_module._upsert_labels
+
+    def _fail_label(*_args: object, **_kwargs: object) -> None:
+        raise OSError("injected label failure")
+
+    monkeypatch.setattr(store_module, "_upsert_labels", _fail_label)
+    with pytest.raises(OSError, match="injected label failure"):
+        conversation_store.commit_routing_decision(
+            conv.id,
+            _required_routing_item(),
+            decision_label_key="test.routing.decision",
+            decision_id="decision-atomic",
+            model_override="gpt-subscription-default",
+            unset_harness_override=True,
+        )
+
+    _assert_required_route_absent(conversation_store, conv.id)
+    monkeypatch.setattr(store_module, "_upsert_labels", real_upsert)
+    conversation_store.commit_routing_decision(
+        conv.id,
+        _required_routing_item(),
+        decision_label_key="test.routing.decision",
+        decision_id="decision-atomic",
+        model_override="gpt-subscription-default",
+        unset_harness_override=True,
+    )
+    _assert_required_route_committed(conversation_store, conv.id)
+
+
+def test_required_routing_successful_retry_is_idempotent(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Repeating one committed decision returns its receipt without duplication."""
+    conv = conversation_store.create_conversation()
+    conversation_store.update_conversation(conv.id, harness_override="auto")
+    item = _required_routing_item()
+    first = conversation_store.commit_routing_decision(
+        conv.id,
+        item,
+        decision_label_key="test.routing.decision",
+        decision_id="decision-atomic",
+        model_override="gpt-subscription-default",
+        unset_harness_override=True,
+    )
+    retried = conversation_store.commit_routing_decision(
+        conv.id,
+        item,
+        decision_label_key="test.routing.decision",
+        decision_id="decision-atomic",
+        model_override="gpt-subscription-default",
+        unset_harness_override=True,
+    )
+
+    assert retried.id == first.id
+    _assert_required_route_committed(conversation_store, conv.id)
+
+
+def test_required_routing_rejects_a_conflicting_second_decision(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A route-once label prevents a concurrent or stale caller from replacing a route."""
+    conv = conversation_store.create_conversation()
+    conversation_store.update_conversation(conv.id, harness_override="auto")
+    conversation_store.commit_routing_decision(
+        conv.id,
+        _required_routing_item(),
+        decision_label_key="test.routing.decision",
+        decision_id="decision-atomic",
+        model_override="gpt-subscription-default",
+        unset_harness_override=True,
+    )
+
+    with pytest.raises(RuntimeError, match="different routing decision"):
+        conversation_store.commit_routing_decision(
+            conv.id,
+            _required_routing_item(
+                "routing_conflict",
+                decision_id="decision-conflict",
+            ),
+            decision_label_key="test.routing.decision",
+            decision_id="decision-conflict",
+            model_override="claude-subscription-default",
+            harness_override="claude-sdk",
+        )
+
+    _assert_required_route_committed(conversation_store, conv.id)
+
+
+def test_required_routing_rejects_a_receipt_label_identity_mismatch(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The receipt and route-once label cannot name different decisions."""
+    conv = conversation_store.create_conversation()
+
+    with pytest.raises(ValueError, match="share a decision id"):
+        conversation_store.commit_routing_decision(
+            conv.id,
+            _required_routing_item(),
+            decision_label_key="test.routing.decision",
+            decision_id="different-decision",
+            model_override="gpt-subscription-default",
+        )
+
+    untouched = conversation_store.get_conversation(conv.id)
+    assert untouched is not None
+    assert untouched.model_override is None
+    assert untouched.labels == {}
+    assert conversation_store.list_items(conv.id).data == []
+
+
 def test_append_and_list_items(conversation_store: SqlAlchemyConversationStore) -> None:
     conv = conversation_store.create_conversation()
     items = conversation_store.append(
@@ -489,6 +701,42 @@ def test_append_and_list_items(conversation_store: SqlAlchemyConversationStore) 
     assert len(page.data) == 2
     assert page.data[0].data.role == "user"
     assert page.data[1].data.role == "assistant"
+
+
+def test_idempotent_append_reuses_one_input_and_tracks_delivery_state(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """One request key owns one durable input across delivery retries."""
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="turn_idempotency",
+        data=MessageData(
+            role="user",
+            content=[{"type": "input_text", "text": "send once"}],
+        ),
+        created_by="alice",
+    )
+
+    first, created = conversation_store.append_idempotent(
+        conv.id, item, idempotency_key="client-request-1"
+    )
+    retried, created_again = conversation_store.append_idempotent(
+        conv.id, item, idempotency_key="client-request-1"
+    )
+
+    assert created is True
+    assert created_again is False
+    assert retried.id == first.id
+    assert first.status == "in_progress"
+    completed = conversation_store.set_item_status(conv.id, first.id, "completed")
+    assert completed is not None
+    assert completed.status == "completed"
+    fetched = conversation_store.get_idempotent_item(conv.id, idempotency_key="client-request-1")
+    assert fetched is not None
+    assert fetched.id == first.id
+    assert fetched.status == "completed"
+    assert [item.id for item in conversation_store.list_items(conv.id).data] == [first.id]
 
 
 def test_append_records_human_author_attribution(

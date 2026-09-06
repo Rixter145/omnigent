@@ -3,9 +3,9 @@
 polly is the standalone multi-agent coding orchestrator (successor to the
 deleted nessie example, whose deep structural pins were folded in here).
 Loads the bundle and asserts the distinctive wiring stays intact: the
-claude-sdk orchestrator brain, the seven cross-vendor coding sub-agents
-(claude_code / codex / opencode / cursor / hermes / agy / pi, which implement,
-review, and explore),
+claude-sdk orchestrator brain, the provider-neutral subscription worker plus
+the seven explicit cross-vendor coding sub-agents (claude_code / codex /
+opencode / cursor / hermes / agy / pi, which implement, review, and explore),
 the three spine skills, and the bounds/blast-radius guardrails. Pure spec-load
 — no LLM, no credentials.
 
@@ -69,13 +69,10 @@ def test_orchestrator_executor(polly_spec: AgentSpec) -> None:
 
 def test_coding_subagents(polly_spec: AgentSpec) -> None:
     """
-    The bundle has exactly seven coding sub-agents: ``claude_code`` (claude-native),
-    ``codex`` (codex-native), ``opencode`` (opencode-native), ``cursor``
-    (cursor-native), ``hermes`` (hermes-native), and ``agy`` (antigravity-native)
-    on the native terminal harnesses, plus ``pi`` (pi) as the headless
-    multi-model worker. All implement, review, and explore. The native
-    harnesses render terminal-first (Chat / Terminal pill) so the human can
-    watch or take over.
+    The bundle has eight coding sub-agents. ``subscription_worker`` is the
+    independently routed child; Claude and Codex use Windows-safe SDK
+    harnesses, Cursor uses the explicit WSL transport, and the remaining
+    explicit workers preserve their existing harnesses.
 
     A missing/renamed agent means fewer implementers, and same-vendor harnesses
     would break cross-vendor review — polly's differentiator.
@@ -89,24 +86,37 @@ def test_coding_subagents(polly_spec: AgentSpec) -> None:
         "hermes",
         "opencode",
         "pi",
+        "subscription_worker",
     ]
-    assert fam["claude_code"] == "claude-native"
-    assert fam["codex"] == "codex-native"
+    assert fam["subscription_worker"] == "claude-sdk"
+    assert fam["claude_code"] == "claude-sdk"
+    assert fam["codex"] == "codex"
     assert fam["opencode"] == "opencode-native"
-    assert fam["cursor"] == "cursor-native"
+    assert fam["cursor"] == "cursor-wsl"
     assert fam["hermes"] == "hermes-native"
     assert fam["agy"] == "antigravity-native"
     assert fam["pi"] == "pi"
-    # Seven distinct vendors → any implementer's diff is reviewable by another.
+    # The virtual worker shares a placeholder with Claude; seven explicit
+    # harness families remain available for cross-vendor review.
     assert len(set(fam.values())) == 7
     # Headless bypass knobs so workers don't stall on ApprovalCards.
     by_name = {a.name: a for a in polly_spec.sub_agents}
     assert by_name["claude_code"].executor.config.get("permission_mode") == "auto"
     assert by_name["claude_code"].executor.model is None
-    assert by_name["codex"].executor.config.get("yolo") in (True, "True", "true")
-    assert by_name["cursor"].executor.config.get("yolo") in (True, "True", "true")
-    assert by_name["cursor"].executor.model == "grok-4.5"
-    for name in ("claude_code", "codex", "opencode", "cursor", "hermes", "agy", "pi"):
+    assert by_name["subscription_worker"].executor.config.get("smart_routing_harness") == "auto"
+    assert by_name["codex"].executor.config.get("yolo") is None
+    assert by_name["cursor"].executor.config.get("yolo") is None
+    assert by_name["cursor"].executor.model is None
+    for name in (
+        "subscription_worker",
+        "claude_code",
+        "codex",
+        "opencode",
+        "cursor",
+        "hermes",
+        "agy",
+        "pi",
+    ):
         prompt = (_POLLY_BUNDLE / "agents" / name / "config.yaml").read_text(encoding="utf-8")
         assert "IMPLEMENT — write real product code" in prompt
         assert "REVIEW — verify another agent's diff" in prompt
@@ -251,7 +261,16 @@ def test_polly_test_count_ground_truth_guidance() -> None:
     assert "miscount`, `over-report`, or `fabrication`" in config_compact
     assert "exact file set/command/commit" in cross_review_compact
 
-    for name in ("claude_code", "codex", "opencode", "cursor", "hermes", "agy", "pi"):
+    for name in (
+        "subscription_worker",
+        "claude_code",
+        "codex",
+        "opencode",
+        "cursor",
+        "hermes",
+        "agy",
+        "pi",
+    ):
         worker = (_POLLY_BUNDLE / "agents" / name / "config.yaml").read_text(encoding="utf-8")
         worker_compact = " ".join(worker.split())
         assert "When you report test results, include the exact command and file set" in (
@@ -354,9 +373,10 @@ def test_investigation_skill_delegates_read_only_work() -> None:
 
     assert "Use for any read-only task: investigation, debugging, audit" in compact
     assert (
-        "Dispatch each task to `claude_code`, `codex`, `opencode`, `cursor`, `hermes`, "
-        "`agy`, or `pi`: "
-        '`sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"agy"|"pi", '
+        "Dispatch each task to `subscription_worker`, `claude_code`, `codex`, "
+        "`opencode`, `cursor`, `hermes`, `agy`, or `pi`: "
+        '`sys_session_send(agent="subscription_worker"|"claude_code"|"codex"|'
+        '"opencode"|"cursor"|"hermes"|"agy"|"pi", '
         'title="explore-<task_slug>", '
         'args={purpose: "explore", input: "<question + exact scope + evidence requested>"})`'
     ) in compact
@@ -428,7 +448,16 @@ def test_orchestrator_guardrails(polly_spec: AgentSpec) -> None:
 def test_subagent_guardrails(polly_spec: AgentSpec) -> None:
     """Each sub-agent carries the blast_radius gate (push/destructive)."""
     by_name = {a.name: a for a in polly_spec.sub_agents}
-    for name in ("claude_code", "codex", "opencode", "cursor", "hermes", "agy", "pi"):
+    for name in (
+        "subscription_worker",
+        "claude_code",
+        "codex",
+        "opencode",
+        "cursor",
+        "hermes",
+        "agy",
+        "pi",
+    ):
         guardrails = by_name[name].guardrails
         assert guardrails is not None, name
         assert [p.name for p in guardrails.policies] == ["blast_radius"], name
@@ -461,6 +490,6 @@ def test_function_policies_have_nonempty_arguments(polly_spec: AgentSpec) -> Non
             )
             checked += 1
     # orchestrator: blast_radius + spawn_bounds + headless_subagent_purpose_guard
-    # = 3; sub-agents: blast_radius x7 (claude_code, codex, opencode, cursor,
-    # hermes, agy, pi) = 7 -> 10 total. Fewer = a policy dropped.
-    assert checked == 10, f"expected 10 function policies in the bundle, inspected {checked}"
+    # = 3; sub-agents: blast_radius x8 (subscription_worker plus the seven
+    # explicit workers) = 8 -> 11 total. Fewer = a policy dropped.
+    assert checked == 11, f"expected 11 function policies in the bundle, inspected {checked}"

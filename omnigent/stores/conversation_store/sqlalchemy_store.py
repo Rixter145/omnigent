@@ -95,6 +95,7 @@ from omnigent.stores.conversation_store import (
     ConversationStore,
     CreatedSession,
     SessionConnectivity,
+    event_idempotency_label_key,
     pinned_label_key,
 )
 
@@ -882,10 +883,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             # short-circuit on equal values), which is what we
             # want here.
             session.execute(
-                text("UPDATE conversations SET updated_at = updated_at WHERE id = :id"),
+                text(
+                    "UPDATE conversations SET updated_at = updated_at "
+                    "WHERE workspace_id = :workspace_id AND id = :id"
+                ),
                 # Raw SQL bypasses the Uuid16 decorator; bind the 16-byte form
                 # so the WHERE matches the binary id column.
-                {"id": uuid_to_bytes(conversation_id)},
+                {
+                    "workspace_id": current_workspace_id(),
+                    "id": uuid_to_bytes(conversation_id),
+                },
             )
 
     def create_conversation(
@@ -2187,6 +2194,287 @@ class SqlAlchemyConversationStore(ConversationStore):
                 conv_row.next_position = next_pos
 
         return persisted
+
+    def append_idempotent(
+        self,
+        conversation_id: str,
+        item: NewConversationItem,
+        *,
+        idempotency_key: str,
+    ) -> tuple[ConversationItem, bool]:
+        """Atomically append one client-keyed input or return its receipt."""
+        now = now_epoch()
+        raw_data = strip_nul_bytes(json.dumps(item.data.model_dump(exclude_none=True)))
+        encoded_data = self._encode_item_data_batch([raw_data])[0]
+        workspace_id = current_workspace_id()
+        receipt_key = event_idempotency_label_key(idempotency_key)
+
+        with self._conv_session_immediate("append_idempotent_conversation_item") as session:
+            self._lock_conversation(session, conversation_id)
+            conv_row = session.get(SqlConversation, (workspace_id, conversation_id))
+            if conv_row is None:
+                raise ConversationNotFoundError(f"conversation {conversation_id!r} does not exist")
+            receipt = session.get(
+                SqlConversationLabel,
+                (workspace_id, conversation_id, receipt_key),
+            )
+            if receipt is not None:
+                existing_row = session.scalar(
+                    select(SqlConversationItem).where(
+                        SqlConversationItem.workspace_id == workspace_id,
+                        SqlConversationItem.conversation_id == conversation_id,
+                        SqlConversationItem.id == receipt.value,
+                    )
+                )
+                if existing_row is None:
+                    raise RuntimeError("event idempotency receipt has no matching input")
+                [existing_data] = self._decode_item_data_batch([existing_row.data])
+                existing_item = _to_item(existing_row, existing_data)
+                same_request = (
+                    existing_item.type == item.type
+                    and existing_item.data.model_dump(exclude_none=True)
+                    == item.data.model_dump(exclude_none=True)
+                    and existing_item.created_by == item.created_by
+                )
+                if not same_request:
+                    raise RuntimeError("conflicting retry for event idempotency key")
+                return existing_item, False
+
+            conv_row.updated_at = now
+            if conv_row.next_position is not None:
+                position = conv_row.next_position
+            else:
+                position = (
+                    session.execute(
+                        select(func.coalesce(func.max(SqlConversationItem.position), -1)).where(
+                            SqlConversationItem.workspace_id == workspace_id,
+                            SqlConversationItem.conversation_id == conversation_id,
+                        )
+                    ).scalar_one()
+                    + 1
+                )
+            item_id = generate_item_id(item.type)
+            search = self._item_search_text(item)
+            values: dict[str, object] = {
+                "workspace_id": workspace_id,
+                "id": item_id,
+                "conversation_id": conversation_id,
+                "response_id": item.response_id,
+                "created_at": now,
+                "status": encode_item_status("in_progress"),
+                "position": position,
+                "type": encode_item_type(item.type),
+                "data": encoded_data,
+                "created_by": item.created_by,
+            }
+            fts_rows: list[tuple[str, str, str]] = []
+            if search is not None:
+                values["search_text"] = search
+                fts_rows.append((item_id, conversation_id, search))
+            session.execute(insert(SqlConversationItem), [values])
+            insert_fts_bulk(session, fts_rows)
+            conv_row.next_position = position + 1
+            _upsert_labels(session, conversation_id, {receipt_key: item_id}, now)
+
+        return (
+            ConversationItem(
+                id=item_id,
+                type=item.type,
+                status="in_progress",
+                response_id=item.response_id,
+                created_at=now,
+                data=item.data,
+                created_by=item.created_by,
+            ),
+            True,
+        )
+
+    def get_idempotent_item(
+        self,
+        conversation_id: str,
+        *,
+        idempotency_key: str,
+    ) -> ConversationItem | None:
+        """Read the input receipt for a client event key without dispatching it."""
+        workspace_id = current_workspace_id()
+        receipt_key = event_idempotency_label_key(idempotency_key)
+        with self._conv_session("get_idempotent_conversation_item") as session:
+            receipt = session.get(
+                SqlConversationLabel,
+                (workspace_id, conversation_id, receipt_key),
+            )
+            if receipt is None:
+                return None
+            row = session.scalar(
+                select(SqlConversationItem).where(
+                    SqlConversationItem.workspace_id == workspace_id,
+                    SqlConversationItem.conversation_id == conversation_id,
+                    SqlConversationItem.id == receipt.value,
+                )
+            )
+            if row is None:
+                raise RuntimeError("event idempotency receipt has no matching input")
+            [data] = self._decode_item_data_batch([row.data])
+            return _to_item(row, data)
+
+    def set_item_status(
+        self,
+        conversation_id: str,
+        item_id: str,
+        status: str,
+    ) -> ConversationItem | None:
+        """Set a request input's dispatch state without changing its receipt."""
+        encoded_status = encode_item_status(status)
+        workspace_id = current_workspace_id()
+        with self._conv_session("set_conversation_item_status") as session:
+            self._lock_conversation(session, conversation_id)
+            row = session.scalar(
+                select(SqlConversationItem).where(
+                    SqlConversationItem.workspace_id == workspace_id,
+                    SqlConversationItem.conversation_id == conversation_id,
+                    SqlConversationItem.id == item_id,
+                )
+            )
+            if row is None:
+                return None
+            row.status = encoded_status
+            [data] = self._decode_item_data_batch([row.data])
+            return _to_item(row, data)
+
+    def commit_routing_decision(
+        self,
+        conversation_id: str,
+        item: NewConversationItem,
+        *,
+        decision_label_key: str,
+        decision_id: str,
+        model_override: str | None = None,
+        harness_override: str | None = None,
+        unset_harness_override: bool = False,
+    ) -> ConversationItem:
+        """Atomically pin, append, and label one required route.
+
+        Required subscription routing cannot tolerate the three writes being
+        separate transactions: a failed receipt after a model update would
+        leave an unreceipted pin that bypasses routing on retry. All affected
+        rows live in the Agent Platform database, so one immediate/row-locked
+        transaction gives the route a real all-or-nothing commit boundary.
+        """
+        if item.type != "routing_decision":
+            raise ValueError("atomic routing commit requires a routing_decision item")
+        if getattr(item.data, "decision_id", None) != decision_id:
+            raise ValueError("routing receipt and route-once label must share a decision id")
+
+        now = now_epoch()
+        raw_data = strip_nul_bytes(json.dumps(item.data.model_dump(exclude_none=True)))
+        encoded_data = self._encode_item_data_batch([raw_data])[0]
+        workspace_id = current_workspace_id()
+
+        with self._conv_session_immediate("commit_routing_decision") as session:
+            self._lock_conversation(session, conversation_id)
+            conv_row = session.get(SqlConversation, (workspace_id, conversation_id))
+            if conv_row is None:
+                raise ConversationNotFoundError(f"conversation {conversation_id!r} does not exist")
+
+            overrides = _decode_session_overrides(conv_row.session_overrides)
+            existing_label = session.get(
+                SqlConversationLabel,
+                (workspace_id, conversation_id, decision_label_key),
+            )
+            if existing_label is not None:
+                if existing_label.value != decision_id:
+                    raise RuntimeError("conversation already has a different routing decision")
+                existing_row = session.scalar(
+                    select(SqlConversationItem).where(
+                        SqlConversationItem.workspace_id == workspace_id,
+                        SqlConversationItem.conversation_id == conversation_id,
+                        SqlConversationItem.response_id == item.response_id,
+                        SqlConversationItem.type == encode_item_type("routing_decision"),
+                    )
+                )
+                if existing_row is None:
+                    raise RuntimeError("routing decision label has no matching receipt")
+                [existing_data] = self._decode_item_data_batch([existing_row.data])
+                existing_item = _to_item(existing_row, existing_data)
+                same_payload = existing_item.data.model_dump(exclude_none=True) == (
+                    item.data.model_dump(exclude_none=True)
+                )
+                same_pins = (
+                    (model_override is None or overrides["model_override"] == model_override)
+                    and (
+                        harness_override is None
+                        or overrides["harness_override"] == harness_override
+                    )
+                    and (not unset_harness_override or overrides["harness_override"] is None)
+                )
+                if (
+                    not same_payload
+                    or not same_pins
+                    or existing_item.created_by != item.created_by
+                ):
+                    raise RuntimeError("conflicting retry for committed routing decision")
+                return existing_item
+
+            if model_override is not None:
+                overrides["model_override"] = model_override
+            if unset_harness_override:
+                overrides["harness_override"] = None
+            elif harness_override is not None:
+                overrides["harness_override"] = harness_override
+            conv_row.session_overrides = _encode_session_overrides(overrides)
+
+            if conv_row.next_position is not None:
+                position = conv_row.next_position
+            else:
+                position = (
+                    session.execute(
+                        select(func.coalesce(func.max(SqlConversationItem.position), -1)).where(
+                            SqlConversationItem.workspace_id == workspace_id,
+                            SqlConversationItem.conversation_id == conversation_id,
+                        )
+                    ).scalar_one()
+                    + 1
+                )
+
+            item_id = generate_item_id(item.type)
+            search = self._item_search_text(item)
+            values: dict[str, object] = {
+                "workspace_id": workspace_id,
+                "id": item_id,
+                "conversation_id": conversation_id,
+                "response_id": item.response_id,
+                "created_at": now,
+                "status": encode_item_status("completed"),
+                "position": position,
+                "type": encode_item_type(item.type),
+                "data": encoded_data,
+                "created_by": item.created_by,
+            }
+            fts_rows: list[tuple[str, str, str]] = []
+            if search is not None:
+                values["search_text"] = search
+                fts_rows.append((item_id, conversation_id, search))
+            session.execute(insert(SqlConversationItem), [values])
+            insert_fts_bulk(session, fts_rows)
+
+            conv_row.next_position = position + 1
+            conv_row.updated_at = now
+            _upsert_labels(
+                session,
+                conversation_id,
+                {decision_label_key: decision_id},
+                now,
+            )
+
+        return ConversationItem(
+            id=item_id,
+            type=item.type,
+            status="completed",
+            response_id=item.response_id,
+            created_at=now,
+            data=item.data,
+            created_by=item.created_by,
+        )
 
     def list_projects(
         self,

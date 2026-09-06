@@ -526,8 +526,10 @@ def mock_llm_server_url(
             resp = httpx.get(f"{base_url}/stats", timeout=1.0)
             if resp.status_code == 200:
                 break
-        except httpx.ConnectError:
-            # Expected while the mock server is still booting.
+        except (httpx.ConnectError, httpx.TimeoutException):
+            # Expected while the mock server is still booting. Windows can
+            # accept the socket before uvicorn is ready to answer, which is a
+            # connect/read timeout rather than a refused connection.
             pass
         time.sleep(0.1)
     else:
@@ -785,16 +787,28 @@ def built_spa(request: pytest.FixtureRequest) -> None:
         # COREPACK_ENABLE_DOWNLOAD_PROMPT=0 keeps a corepack `pnpm` shim
         # from blocking on its download confirmation under captured
         # pytest output, which reads as a hung test run.
-        env = {**os.environ, "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
+        env = {
+            **os.environ,
+            "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
+            # Captured pytest has no interactive TTY. Without CI mode pnpm
+            # refuses a required node_modules refresh instead of doing it.
+            "CI": os.environ.get("CI", "true"),
+        }
+        # Corepack exposes pnpm as ``pnpm.cmd`` on Windows. ``subprocess`` with
+        # ``shell=False`` does not resolve that shim from the bare ``pnpm``
+        # name, so select the platform executable explicitly.
+        pnpm = shutil.which("pnpm.cmd" if os.name == "nt" else "pnpm")
+        if pnpm is None:
+            raise RuntimeError("pnpm is required to build the browser test SPA")
         subprocess.run(
-            ["pnpm", "install", "--frozen-lockfile", "--filter", "web"],
+            [pnpm, "install", "--frozen-lockfile", "--filter", "web"],
             cwd=_REPO_ROOT,
             check=True,
             stdin=subprocess.DEVNULL,
             env=env,
         )
         subprocess.run(
-            ["pnpm", "--filter", "web", "run", "build"],
+            [pnpm, "--filter", "web", "run", "build"],
             cwd=_REPO_ROOT,
             check=True,
             stdin=subprocess.DEVNULL,
@@ -835,6 +849,7 @@ def _spawn_runner_against_external_server(
         "OMNIGENT_RUNNER_ID": runner_id,
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
         "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
+        "OMNIGENT_HARNESS_TMP_PARENT": str(runner_tmp / "harness"),
         "RUNNER_SERVER_URL": base_url,
     }
     log_handle = open(log_path, "w")  # noqa: SIM115 — closed in finally
@@ -1051,6 +1066,7 @@ def live_server(
         "OMNIGENT_RUNNER_ID": runner_id,
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
         "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
+        "OMNIGENT_HARNESS_TMP_PARENT": str(server_tmp / "runner-harness"),
         "RUNNER_SERVER_URL": base_url,
         # Route the openai-agents harness to the mock LLM server so no
         # real provider credentials are needed for agent turns. Without
@@ -1309,6 +1325,7 @@ def _ensure_runner_online(
         "OMNIGENT_RUNNER_ID": runner_id,
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
         "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
+        "OMNIGENT_HARNESS_TMP_PARENT": str(runner_tmp / "harness"),
         "RUNNER_SERVER_URL": base_url,
         # Mirror the live_server runner's mock-LLM routing so the
         # respawned runner's harness also hits the mock.
@@ -2926,6 +2943,7 @@ def mocked_native_codex_session(
         "OMNIGENT_RUNNER_ID": runner_id,
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
         "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
+        "OMNIGENT_HARNESS_TMP_PARENT": str(server_tmp / "runner-harness"),
         "RUNNER_SERVER_URL": base_url,
     }
 

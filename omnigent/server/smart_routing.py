@@ -13,13 +13,16 @@ swap in a different implementation via ``RuntimeCaps``.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.model_fallbacks import (
     SMART_ROUTING_CLAUDE_LADDER,
     SMART_ROUTING_CURRENT_GENERATION_GPT,
@@ -107,6 +110,11 @@ _HARNESS_FAMILY: dict[str, str] = {
     "openai-agents": "gpt",
     "openai-agents-sdk": "gpt",
     "agents_sdk": "gpt",
+    "gemini-cli": "gemini",
+    "gemini": "gemini",
+    # Cursor's auto-smart route can choose across the models included in the
+    # user's Cursor subscription, so it is intentionally multi-family.
+    "cursor-wsl": "multi",
 }
 
 
@@ -236,6 +244,14 @@ class RoutingResult:
     rationale: str
     harness: str | None = None
     raw_model: str | None = None
+
+
+class RequiredRoutingUnavailable(OmnigentError):
+    """A required opt-in router could not produce a validated route."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason.strip() or "subscription routing is unavailable"
+        super().__init__(self.reason, code=ErrorCode.RUNNER_UNAVAILABLE)
 
 
 class RoutingClient(Protocol):
@@ -496,6 +512,10 @@ Harness descriptions:
   code changes.
 - pi: Multi-model headless harness; can run both Claude and GPT models;
   best for read-only exploration, review, and cross-vendor verification.
+- gemini-cli: Google Gemini CLI enterprise/API-key compatibility harness;
+  individual Google subscriptions are policy-excluded from third-party routing.
+- cursor-wsl: Cursor subscription CLI inside an explicitly configured WSL2
+  distro; best for implementation tasks delegated through Cursor auto-smart.
 
 Each harness list is ordered by provider-relative cost when the catalog reports
 it, with provider catalog order as the tie-breaker. Classify the task using
@@ -977,6 +997,322 @@ class RoutingSettings:
     servable_aliases: Mapping[str, str] | None = None
     current_generation_models: Mapping[str, Sequence[str]] | None = None
     model_effort_caps: ModelEffortCaps | None = None
+    # Optional subscription routing is deliberately additive.  ``None`` keeps
+    # all legacy routing behavior, while ``required`` changes only this opt-in
+    # provider's unavailable path.
+    provider: str | None = None
+    judge_order: tuple[str, ...] = ("codex", "claude")
+    required: bool = False
+    allowance_hints: Any = None
+
+
+class SubscriptionRoutingPolicyClient:
+    """Policy wrapper around the credential-blind subscription client.
+
+    The leaf client owns menu validation and semantic judging.  This wrapper
+    adds the integration contract: no candidates means unavailable, one
+    validated candidate is deterministic, and two or more candidates use the
+    configured subscription judges.
+    """
+
+    router_source = "deterministic"
+
+    def __init__(
+        self,
+        *,
+        judge_order: tuple[str, ...] = ("codex", "claude"),
+        allowance_hints: Any = None,
+        transports: tuple[Any, ...] | None = None,
+        transport_factory: Any = None,
+        readiness_provider: Any = None,
+        readiness_ttl_s: float = 30.0,
+    ) -> None:
+        from omnigent.server.subscription_routing import (
+            ClaudeSubscriptionTransport,
+            CodexSubscriptionTransport,
+            SubscriptionRoutingClient,
+        )
+
+        factories = {
+            "codex": CodexSubscriptionTransport,
+            "claude": ClaudeSubscriptionTransport,
+        }
+        ordered = tuple(
+            dict.fromkeys(item.strip().lower() for item in judge_order if item.strip())
+        )
+        if transports is None:
+            built: list[Any] = []
+            for provider in ordered:
+                factory = factories.get(provider)
+                if factory is not None:
+                    built.append(factory())
+            transports = tuple(built) or None
+        preferred = self._preferred_models(allowance_hints)
+        self._client = SubscriptionRoutingClient(
+            transports=transports,
+            transport_factory=transport_factory,
+            soft_allowance_models=preferred,
+        )
+        self.allowance_hints = allowance_hints
+        self._readiness_provider = readiness_provider
+        self._readiness_ttl_s = max(0.0, float(readiness_ttl_s))
+        self._readiness_cache: dict[str, dict[str, Any]] | None = None
+        self._readiness_cached_at = 0.0
+        self._readiness_lock = asyncio.Lock()
+        self.last_error: str | None = None
+        self.last_metadata: dict[str, Any] = {}
+
+    @staticmethod
+    def _flatten(available_models: dict[str, list[str]]) -> list[tuple[str, str]]:
+        return [
+            (harness, model)
+            for harness, models in available_models.items()
+            for model in models
+            if isinstance(harness, str) and isinstance(model, str) and model.strip()
+        ]
+
+    @staticmethod
+    def _preferred_models(hints: Any) -> tuple[str, ...]:
+        """Extract bounded allowance preferences without changing candidate order."""
+        preferred: list[str] = []
+        if isinstance(hints, dict):
+            raw = hints.get("preferred_models")
+            if isinstance(raw, list):
+                preferred = [item for item in raw if isinstance(item, str)]
+        elif isinstance(hints, (list, tuple)):
+            preferred = [item for item in hints if isinstance(item, str)]
+        return tuple(dict.fromkeys(item.strip() for item in preferred if item.strip()))[:32]
+
+    @staticmethod
+    def _safe_readiness_entry(provider: str, raw: Any) -> dict[str, Any]:
+        """Project one readiness value onto the credential-blind public fields."""
+        if hasattr(raw, "to_dict") and callable(raw.to_dict):
+            raw = raw.to_dict()
+        data = raw if isinstance(raw, dict) else {}
+        provenance = data.get("provenance")
+        safe_provenance = (
+            [str(item)[:100] for item in provenance[:16]]
+            if isinstance(provenance, (list, tuple))
+            else []
+        )
+        return {
+            "provider": provider,
+            "state": str(data.get("state") or "not-ready")[:40],
+            "installed": data.get("installed") is True,
+            "auth_present": data.get("auth_present") is True,
+            "auth_verified": data.get("auth_verified") is True,
+            "transport_ready": data.get("transport_ready") is True,
+            "provenance": safe_provenance,
+            "last_verified": (
+                str(data["last_verified"])[:100] if data.get("last_verified") is not None else None
+            ),
+            "reason": str(data["reason"])[:300] if data.get("reason") is not None else None,
+        }
+
+    @staticmethod
+    def _provider_ready(provider: str, readiness: dict[str, Any]) -> bool:
+        """Apply provider-accurate readiness without consuming a routing prompt."""
+        if readiness.get("installed") is not True:
+            return False
+        if provider in {"claude", "codex"}:
+            # Both CLIs expose a non-generating login-status command.
+            return readiness.get("auth_verified") is True
+        if provider == "gemini-cli":
+            # Gemini consumer subscriptions moved to Antigravity, whose terms
+            # bar third-party OAuth routing. Readiness can describe the local
+            # install but never make this arm eligible.
+            return False
+        if provider == "cursor-wsl":
+            # Cursor status runs inside the explicitly configured distro.
+            return (
+                readiness.get("transport_ready") is True and readiness.get("auth_present") is True
+            )
+        return False
+
+    async def _fresh_readiness(self) -> dict[str, dict[str, Any]]:
+        """Collect all readiness checks concurrently, outside the event loop."""
+        callback = self._readiness_provider
+        if callback is not None:
+            if inspect.iscoroutinefunction(callback):
+                raw = await callback()
+            else:
+                raw = await asyncio.to_thread(callback)
+                if inspect.isawaitable(raw):
+                    raw = await raw
+            if not isinstance(raw, dict):
+                raise TypeError("subscription readiness provider returned no mapping")
+            return {
+                str(provider): self._safe_readiness_entry(str(provider), value)
+                for provider, value in raw.items()
+            }
+
+        from omnigent.onboarding.subscription_readiness import (
+            SUPPORTED_PROVIDERS,
+            subscription_readiness,
+        )
+
+        values = await asyncio.gather(
+            *(
+                asyncio.to_thread(subscription_readiness, provider, verify=True)
+                for provider in SUPPORTED_PROVIDERS
+            ),
+            return_exceptions=True,
+        )
+        snapshot: dict[str, dict[str, Any]] = {}
+        for provider, value in zip(SUPPORTED_PROVIDERS, values, strict=True):
+            if isinstance(value, BaseException):
+                value = {
+                    "state": "not-ready",
+                    "reason": f"readiness check failed: {type(value).__name__}",
+                }
+            snapshot[provider] = self._safe_readiness_entry(provider, value)
+        return snapshot
+
+    async def _readiness(self) -> dict[str, dict[str, Any]]:
+        now = time.monotonic()
+        if (
+            self._readiness_cache is not None
+            and now - self._readiness_cached_at <= self._readiness_ttl_s
+        ):
+            return self._readiness_cache
+        async with self._readiness_lock:
+            now = time.monotonic()
+            if (
+                self._readiness_cache is not None
+                and now - self._readiness_cached_at <= self._readiness_ttl_s
+            ):
+                return self._readiness_cache
+            self._readiness_cache = await self._fresh_readiness()
+            self._readiness_cached_at = time.monotonic()
+            return self._readiness_cache
+
+    async def route(
+        self,
+        message: str,
+        available_models: dict[str, list[str]],
+    ) -> RoutingResult | None:
+        # Reuse the leaf's bounded/printable/duplicate filtering before either
+        # deterministic selection or semantic judging.
+        from omnigent.server.subscription_routing import _normalize_menu
+        from omnigent.subscription_defaults import (
+            SUBSCRIPTION_POLICY_EXCLUSIONS,
+            subscription_provider,
+        )
+
+        offered = _normalize_menu(available_models)
+        self.last_error = None
+        if not self._flatten(offered):
+            self.router_source = "deterministic"
+            self.last_error = "no validated subscription candidates"
+            self.last_metadata = {
+                "selection_mode": "unavailable",
+                "candidate_count": 0,
+                "offered_candidate_count": 0,
+                "readiness": {},
+                "eligible_candidates": {},
+                "excluded_candidates": dict(SUBSCRIPTION_POLICY_EXCLUSIONS),
+            }
+            return None
+        try:
+            readiness = await self._readiness()
+        except Exception as exc:  # noqa: BLE001 - readiness fails closed in subscription mode
+            self.router_source = "deterministic"
+            self.last_error = f"subscription readiness check failed: {failure_detail(exc)}"
+            self.last_metadata = {
+                "selection_mode": "unavailable",
+                "candidate_count": 0,
+                "offered_candidate_count": len(self._flatten(offered)),
+                "readiness": {},
+                "eligible_candidates": {},
+                "excluded_candidates": {
+                    **SUBSCRIPTION_POLICY_EXCLUSIONS,
+                    **dict.fromkeys(offered, "readiness check unavailable"),
+                },
+            }
+            return None
+
+        candidates: dict[str, list[str]] = {}
+        excluded: dict[str, str] = dict(SUBSCRIPTION_POLICY_EXCLUSIONS)
+        for harness, models in offered.items():
+            provider = subscription_provider(harness)
+            state = readiness.get(provider or "", {})
+            if provider is not None and self._provider_ready(provider, state):
+                candidates[harness] = models
+            else:
+                excluded[harness] = str(
+                    state.get("reason") or state.get("state") or "unsupported subscription harness"
+                )[:300]
+        flattened = self._flatten(candidates)
+        if not flattened:
+            self.router_source = "deterministic"
+            self.last_error = "no ready subscription candidates"
+            self.last_metadata = {
+                "selection_mode": "unavailable",
+                "candidate_count": 0,
+                "offered_candidate_count": len(self._flatten(offered)),
+                "readiness": readiness,
+                "eligible_candidates": {},
+                "excluded_candidates": excluded,
+            }
+            return None
+        if len(flattened) == 1:
+            harness, model = flattened[0]
+            self.router_source = "deterministic"
+            preferred = [
+                item for item in self._preferred_models(self.allowance_hints) if item == model
+            ]
+            self.last_metadata = {
+                "selection_mode": "deterministic",
+                "candidate_count": 1,
+                "offered_candidate_count": len(self._flatten(offered)),
+                "selected_harness": harness,
+                "selected_model": model,
+                "validation": "validated candidate menu",
+                "readiness": readiness,
+                "eligible_candidates": candidates,
+                "excluded_candidates": excluded,
+                "allowance": {
+                    "policy": "soft tie-break after capability and cross-vendor fit",
+                    "preferred_models": preferred,
+                },
+            }
+            return RoutingResult(
+                model=model,
+                harness=harness,
+                rationale=(
+                    "The only validated subscription candidate was selected deterministically."
+                ),
+            )
+        result = await self._client.route(message, candidates)
+        self.last_error = getattr(self._client, "last_error", None)
+        metadata = getattr(self._client, "metadata", {})
+        self.last_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        self.last_metadata.update(
+            {
+                "offered_candidate_count": len(self._flatten(offered)),
+                "readiness": readiness,
+                "eligible_candidates": candidates,
+                "excluded_candidates": excluded,
+            }
+        )
+        judge = self.last_metadata.get("judge")
+        provider = judge.get("provider") if isinstance(judge, dict) else None
+        self.router_source = (
+            f"subscription-{provider}"
+            if isinstance(provider, str) and provider
+            else "subscription"
+        )
+        if result is None:
+            return None
+        self.last_metadata.update(
+            {
+                "selection_mode": "semantic",
+                "candidate_count": len(flattened),
+                "selected_harness": result.harness,
+                "selected_model": result.model,
+            }
+        )
+        return result
 
 
 def _string_list(raw: Any) -> tuple[str, ...] | None:  # type: ignore[explicit-any]  # parsed YAML
@@ -1103,9 +1439,9 @@ class ResolvedRoute:
     raw_model: str
 
 
-# Harness family that serves several vendors and so never wins family matching
+# Harness families that serve several vendors and so never win family matching
 # outright — only used when no single-vendor harness fits.
-_MULTI_MODEL_FAMILY = "pi"
+_MULTI_MODEL_FAMILIES = frozenset({"pi", "multi"})
 
 # (harness, model) pairs the harness's own gateway 400s on: under pi, Claude
 # models on its ``eager_input_streaming`` field and gpt-5.5/5.6 reasoning models
@@ -1267,7 +1603,8 @@ def natural_harness_for_model(
     chosen = next((h for h in candidates if _HARNESS_FAMILY.get(h) == family), None)
     if chosen is None:
         chosen = next(
-            (h for h in candidates if _HARNESS_FAMILY.get(h) == _MULTI_MODEL_FAMILY), None
+            (h for h in candidates if _HARNESS_FAMILY.get(h) in _MULTI_MODEL_FAMILIES),
+            None,
         )
     if chosen is None:
         chosen = candidates[0] if candidates else None
@@ -1574,6 +1911,18 @@ def routing_settings(caps: Any = None) -> RoutingSettings:  # type: ignore[expli
     return settings if isinstance(settings, RoutingSettings) else RoutingSettings()
 
 
+def routing_required(caps: Any = None) -> bool:  # type: ignore[explicit-any]
+    """Whether this deployment opted into fail-closed subscription routing."""
+    settings = routing_settings(caps)
+    return settings.provider == "subscription" and settings.required is True
+
+
+def required_routing_unavailable(reason: str, *, caps: Any = None) -> None:  # type: ignore[explicit-any]
+    """Raise only for the explicit required subscription mode."""
+    if routing_required(caps):
+        raise RequiredRoutingUnavailable(reason)
+
+
 def routing_last_error(client: Any) -> str | None:  # type: ignore[explicit-any]
     """Read the reason *client*'s last :meth:`route` call returned ``None``.
 
@@ -1585,6 +1934,124 @@ def routing_last_error(client: Any) -> str | None:  # type: ignore[explicit-any]
     """
     detail = getattr(client, "last_error", None)
     return detail if isinstance(detail, str) and detail else None
+
+
+_RECEIPT_MAX_DEPTH = 5
+_RECEIPT_MAX_NODES = 256
+_RECEIPT_SECRET_KEY = re.compile(
+    r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|bearer|"
+    r"password|secret|credential|private[_-]?key|account[_-]?id)",
+    re.IGNORECASE,
+)
+_RECEIPT_SECRET_VALUE = re.compile(
+    r"(?:bearer\s+\S+|(?:api[_-]?key|access[_-]?token|refresh[_-]?token|"
+    r"id[_-]?token|token|"
+    r"secret|password)\s*[:=]\s*\S+|(?:sk|pk|AIza|ghp|github_pat|xoxb|ya29)-[A-Za-z0-9._-]+|"
+    r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})",
+    re.IGNORECASE,
+)
+
+
+def _redact_receipt_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    budget: list[int] | None = None,
+    key: str | None = None,
+) -> Any:  # type: ignore[explicit-any]
+    """Recursively bound and redact untrusted routing metadata."""
+    budget = [0] if budget is None else budget
+    if depth > _RECEIPT_MAX_DEPTH:
+        return "[TRUNCATED]"
+    budget[0] += 1
+    if budget[0] > _RECEIPT_MAX_NODES:
+        return "[TRUNCATED]"
+    if key is not None and _RECEIPT_SECRET_KEY.search(key):
+        return "[REDACTED]"
+    if isinstance(value, str):
+        return _RECEIPT_SECRET_VALUE.sub("[REDACTED]", value)[:1000]
+    if isinstance(value, dict):
+        return {
+            str(child_key)[:80]: _redact_receipt_value(
+                child_value,
+                depth=depth + 1,
+                budget=budget,
+                key=str(child_key),
+            )
+            for child_key, child_value in list(value.items())[:32]
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_receipt_value(item, depth=depth + 1, budget=budget) for item in value[:32]]
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value)[:200]
+
+
+def build_routing_receipt(
+    *,
+    task_summary: str,
+    candidates: Mapping[str, Sequence[str]],
+    client: Any,
+    result: RoutingResult | None,
+    source: str | None,
+    user_override: str | None = None,
+) -> dict[str, Any]:  # type: ignore[explicit-any]
+    """Build a bounded, credential-blind additive routing receipt."""
+    metadata = getattr(client, "last_metadata", None)
+    if not isinstance(metadata, dict):
+        metadata = getattr(client, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    judge = metadata.get("judge") if isinstance(metadata.get("judge"), dict) else {}
+    attempts = metadata.get("attempts")
+    if not isinstance(attempts, list):
+        attempts = []
+    safe_attempts: list[dict[str, Any]] = []
+    for item in attempts[:8]:
+        if not isinstance(item, dict):
+            continue
+        # Keep the bounded raw shape until the final recursive sanitizer. A
+        # routing client is not trusted to pre-redact nested error/readiness
+        # metadata, and dropping nested values here would hide provenance
+        # rather than safely preserving it.
+        safe_attempts.append(dict(list(item.items())[:32]))
+    fallback_chain = [
+        str(item["provider"])
+        for item in safe_attempts
+        if isinstance(item.get("provider"), str) and item["provider"]
+    ]
+    if source and source not in fallback_chain:
+        fallback_chain.append(source)
+    safe_candidates = {
+        str(harness)[:80]: [str(model)[:160] for model in models[:32]]
+        for harness, models in list(candidates.items())[:16]
+    }
+    final_route = None
+    if result is not None:
+        final_route = {"harness": result.harness, "model": result.model}
+    readiness = metadata.get("readiness")
+    safe_readiness = dict(list(readiness.items())[:32]) if isinstance(readiness, dict) else {}
+    validation = metadata.get("validation", "validated candidate menu")
+    if not isinstance(validation, (str, int, float, bool, type(None), dict, list)):
+        validation = str(validation)[:400]
+    receipt = {
+        "task_summary": (task_summary or "")[:4000],
+        "candidates": safe_candidates,
+        "eligible_candidates": metadata.get("eligible_candidates", {}),
+        "excluded_candidates": metadata.get("excluded_candidates", {}),
+        "readiness": safe_readiness,
+        "judge_provider": judge.get("provider"),
+        "judge_model": judge.get("judge_model") or judge.get("model"),
+        "attempts": safe_attempts,
+        "rationale": (result.rationale if result is not None else "")[:1000],
+        "validation": validation,
+        "final_route": final_route,
+        "fallback_chain": fallback_chain,
+        "user_override": user_override,
+        "selection_mode": metadata.get("selection_mode"),
+        "allowance": metadata.get("allowance"),
+    }
+    safe = _redact_receipt_value(receipt)
+    return safe if isinstance(safe, dict) else {}
 
 
 def route_option_source(
@@ -1936,10 +2403,10 @@ class ExternalRoutingClient:
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
-# SDK harnesses offered as candidates when the user picks "auto" harness; native
-# ones need a CLI binary that may not be installed. Order is the tiebreak when
-# several serve the pick: codex precedes pi so GPT models take the Responses
-# API, which pi's completions path 400s on for gpt-5.5+ reasoning models.
+# Legacy headless harnesses offered when the user picks "auto". Subscription
+# mode replaces this default with its eligible authenticated CLI/SDK harnesses in
+# :func:`route_session_harness`; keeping this tuple stable avoids changing the
+# catalog contract for gateway and OSS-LLM deployments.
 _AUTO_ROUTING_HARNESSES: tuple[str, ...] = ("claude-sdk", "codex", "pi")
 
 # Native terminal harnesses offered when Smart Routing is the top-level harness.
@@ -1958,7 +2425,23 @@ _WORKER_NAME_TO_HARNESS: dict[str, str] = {
     "claude-sdk": "claude-sdk",
     "codex": "codex",
     "pi": "pi",
+    "gemini": "gemini-cli",
+    "gemini-cli": "gemini-cli",
+    "cursor": "cursor-wsl",
+    "cursor-wsl": "cursor-wsl",
 }
+
+
+def _subscription_default_candidates(harnesses: Sequence[str]) -> dict[str, list[str]]:
+    """Return provider-default sentinels for recognized subscription harnesses."""
+    from omnigent.subscription_defaults import subscription_default_model
+
+    result: dict[str, list[str]] = {}
+    for harness in harnesses:
+        model = subscription_default_model(harness)
+        if model is not None:
+            result[harness] = [model]
+    return result
 
 
 def _redirect_wire_incompatible_pick(
@@ -2011,6 +2494,7 @@ async def route_session_harness(
     catalog: Mapping[str, Sequence[str]] | None = None,
     gateway_backed: bool = True,
     allow_static_fallback: bool = True,
+    requires_tool_calling: bool = False,
 ) -> tuple[str | None, str | None, dict[str, Any] | None, str | None]:
     """Pick the best harness + model for a new session via the routing client.
 
@@ -2048,6 +2532,10 @@ async def route_session_harness(
         may supply or top up candidates. Callers pass ``gateway_backed``: that
         table is all ``databricks-*`` ids, so off the gateway it would offer
         models the pane cannot run. ``False`` declines instead.
+    :param requires_tool_calling: Restrict subscription routing to harnesses
+        that can consume Omnigent-owned function tools. This is a hard
+        capability gate for orchestrators, not a semantic preference left to
+        the judge.
     :returns: ``(harness, model, verdict, error)`` — on success ``error`` is
         ``None``; on failure ``harness``, ``model``, and ``verdict`` are ``None``
         and ``error`` carries a human-readable reason shown in the UI.
@@ -2057,7 +2545,9 @@ async def route_session_harness(
     try:
         from omnigent.runtime._globals import _caps
     except ImportError:
-        return None, None, None, "Smart routing is not available."
+        reason = "Smart routing is not available."
+        required_routing_unavailable(reason)
+        return None, None, None, reason
 
     from omnigent.server.routing_backend import (
         backends_from_caps,
@@ -2067,7 +2557,9 @@ async def route_session_harness(
 
     backends = backends_from_caps(_caps)
     if select_router(backends, gateway_backed=gateway_backed) is None:
-        return None, None, None, "Smart routing is not configured on this server."
+        reason = "Smart routing is not configured on this server."
+        required_routing_unavailable(reason)
+        return None, None, None, reason
 
     # Fetch the live catalog. Its rows are keyed by worker name (sub-agent
     # names + "self"), so normalize those to harness ids before matching
@@ -2082,13 +2574,41 @@ async def route_session_harness(
     # Incompatible (harness, model) pairs stay on the menu — the router 400s on a
     # partial one — and are corrected post-verdict. Only an auto-harness session
     # may leave its family: a child is offered its parent's family alone.
-    candidate_harnesses = tuple(
-        h
-        for h in (
+    subscription_mode = routing_settings().provider == "subscription"
+    if harness_candidates is None and subscription_mode:
+        from omnigent.subscription_defaults import SUBSCRIPTION_HARNESSES
+
+        default_harnesses: Sequence[str] = SUBSCRIPTION_HARNESSES
+    else:
+        default_harnesses = (
             _AUTO_ROUTING_HARNESSES if harness_candidates is None else tuple(harness_candidates)
         )
+    candidate_harnesses = tuple(
+        h
+        for h in default_harnesses
         if allowed_family is None or _HARNESS_FAMILY.get(h) == allowed_family
     )
+    receipt_candidates: dict[str, list[str]] | None = None
+    capability_exclusions: dict[str, str] = {}
+    if subscription_mode:
+        # Preserve the complete considered menu in the receipt even when a
+        # hard executor-capability gate removes an arm before judging.
+        receipt_candidates = _subscription_default_candidates(candidate_harnesses)
+        if requires_tool_calling:
+            from omnigent.subscription_defaults import (
+                subscription_harness_supports_tool_calling,
+            )
+
+            capability_exclusions = {
+                harness: "does not support Omnigent tool calling in the Windows MVP"
+                for harness in candidate_harnesses
+                if not subscription_harness_supports_tool_calling(harness)
+            }
+            candidate_harnesses = tuple(
+                harness
+                for harness in candidate_harnesses
+                if subscription_harness_supports_tool_calling(harness)
+            )
     harness_models: dict[str, list[str]] = {}
     harness_catalog: dict[str, list[_RunnerModel]] = {}
     if live_catalog:
@@ -2120,8 +2640,10 @@ async def route_session_harness(
     # pane cannot reach, so offering one would route the session onto a model
     # the launch silently drops. Decline instead — the provider-accurate
     # sources are the pre-session catalog and the runner catalog's "self" row.
-    if allow_static_fallback and (
-        not harness_models or (catalog and len(harness_models) < len(candidate_harnesses))
+    if (
+        not subscription_mode
+        and allow_static_fallback
+        and (not harness_models or (catalog and len(harness_models) < len(candidate_harnesses)))
     ):
         for h in candidate_harnesses:
             if h in harness_models:
@@ -2130,8 +2652,22 @@ async def route_session_harness(
             if models:
                 harness_models[h] = models
 
+    # Subscription CLIs do not expose a reliable pre-launch model catalog. A
+    # stable provider-default sentinel is still a truthful route: spawn wiring
+    # translates it back to an omitted --model argument (Cursor's auto-smart is
+    # a real CLI model id). Readiness filtering happens inside the subscription
+    # policy client before deterministic or semantic selection.
+    if subscription_mode:
+        # Never retain a gateway catalog row in subscription mode. These
+        # provider-default routes are the billing boundary: the child CLI uses
+        # its own login and no Databricks/API-key model id reaches launch.
+        harness_models = _subscription_default_candidates(candidate_harnesses)
+        harness_catalog = {}
+
     if not harness_models:
-        return None, None, None, "No routable harnesses are available on this runner."
+        reason = "No routable harnesses are available on this runner."
+        required_routing_unavailable(reason)
+        return None, None, None, reason
 
     try:
         call = await route_with_fallback(
@@ -2139,9 +2675,13 @@ async def route_session_harness(
         )
     except Exception as exc:  # routing failures must not block session creation
         _logger.exception("smart_routing: route_session_harness failed")
-        return None, None, None, f"Routing call failed: {failure_detail(exc)}"
+        reason = f"Routing call failed: {failure_detail(exc)}"
+        required_routing_unavailable(reason)
+        return None, None, None, reason
     if call is None:
-        return None, None, None, "Smart routing is not configured on this server."
+        reason = "Smart routing is not configured on this server."
+        required_routing_unavailable(reason)
+        return None, None, None, reason
     result = call.result
 
     if result is None:
@@ -2153,6 +2693,7 @@ async def route_session_harness(
             if detail
             else "The router returned no verdict; using default harness."
         )
+        required_routing_unavailable(reason)
         return None, None, None, reason
 
     # The client owns resolution: it already mapped the router's pick onto a
@@ -2204,7 +2745,9 @@ async def route_session_harness(
             raw_model = raw_model or chosen_model
             chosen_harness, chosen_model = result.harness, substitute
     if chosen_harness is None:
-        return None, None, None, f"No available harness can run {chosen_model}."
+        reason = f"No available harness can run {chosen_model}."
+        required_routing_unavailable(reason)
+        return None, None, None, reason
 
     # Then the catalog's own wire metadata, which knows endpoints the static bar
     # list cannot. Applied post-verdict so the complete candidate set still
@@ -2223,10 +2766,28 @@ async def route_session_harness(
 
     # The UI shows what the router said, not only what we could run — but only
     # when they are genuinely different models, not the same one spelled bare.
+    receipt = build_routing_receipt(
+        task_summary=user_message,
+        candidates=receipt_candidates or harness_models,
+        client=call.client,
+        result=result,
+        source=call.source,
+    )
+    if capability_exclusions:
+        excluded = receipt.get("excluded_candidates")
+        merged_excluded = dict(excluded) if isinstance(excluded, dict) else {}
+        # A readiness reason remains authoritative when both gates excluded an
+        # arm; otherwise record the capability reason the judge never saw.
+        for harness, reason in capability_exclusions.items():
+            merged_excluded.setdefault(harness, reason)
+        receipt["excluded_candidates"] = merged_excluded
+
     verdict: dict[str, Any] = {
         "model": chosen_model,
         "rationale": result.rationale,
         "router_source": call.source,
+        "routing_required": routing_required(),
+        "receipt": receipt,
     }
     if raw_model and _bare_id(raw_model, prefixes) != _bare_id(chosen_model, prefixes):
         verdict["raw_model"] = raw_model
@@ -2288,6 +2849,7 @@ async def route_turn(
             "smart_routing: route_turn skipped for session=%s: no routing client configured",
             session_id,
         )
+        required_routing_unavailable("Smart routing is not configured on this server.")
         return None, None
 
     _logger.info("smart_routing: routing turn session=%s harness=%s", session_id, harness)
@@ -2299,12 +2861,15 @@ async def route_turn(
     # Prefer the live runner catalog, but only its "self" row — the sub-agent
     # workers' models are not this session's. Key the map by harness id, not the
     # "self" label, so the seam infers the right single-harness scenario.
-    available: dict[str, list[str]] | None = None
-    if catalog:
+    subscription_mode = routing_settings().provider == "subscription"
+    available: dict[str, list[str]] | None = (
+        _subscription_default_candidates((harness,)) if subscription_mode and harness else None
+    )
+    if not subscription_mode and catalog:
         in_vocabulary = models_in_family(harness, catalog)
         if in_vocabulary:
             available = {harness or "self": in_vocabulary}
-    if available is None and session_id and runner_client is not None:
+    if not subscription_mode and available is None and session_id and runner_client is not None:
         _catalog_fetched = True
         runner_catalog = await fetch_runner_models(session_id, runner_client)
         if runner_catalog and "self" in runner_catalog:
@@ -2315,16 +2880,25 @@ async def route_turn(
             if in_family:
                 available = {harness or "self": in_family}
     if not available:
-        # The static table is every ``databricks-*`` id, so off the gateway it
-        # names models this pane cannot be switched to. Decline the turn rather
-        # than route it onto an unreachable endpoint.
-        models = infer_models(harness) if allow_static_fallback else None
+        # Subscription mode has an honest provider-default candidate even
+        # though its CLIs expose no model catalog. Other modes retain the
+        # Databricks static fallback only when the caller permits it.
+        models = (
+            _subscription_default_candidates((harness,)).get(harness)
+            if subscription_mode and harness is not None
+            else infer_models(harness)
+            if allow_static_fallback
+            else None
+        )
         if models is None:
             _logger.info(
                 "smart_routing: route_turn skipped for session=%s: "
                 "no candidate models for harness=%s",
                 session_id,
                 harness,
+            )
+            required_routing_unavailable(
+                f"No validated candidate models are available for harness {harness}."
             )
             return None, None
         available = {harness or "": models}
@@ -2366,6 +2940,11 @@ async def route_turn(
         sum(len(models) for models in available.values()),
     )
     if call is None or call.result is None:
+        required_routing_unavailable(
+            routing_last_error(call.client)
+            if call is not None
+            else "Smart routing is unavailable."
+        )
         return None, None
     result = call.result
 
@@ -2389,6 +2968,9 @@ async def route_turn(
                 harness,
                 model,
             )
+            required_routing_unavailable(
+                f"No validated routed model is available for harness {harness}."
+            )
             return None, None
         raw_model = raw_model or model
         model = substitute
@@ -2400,6 +2982,14 @@ async def route_turn(
         "model": model,
         "rationale": result.rationale,
         "router_source": call.source,
+        "routing_required": routing_required(),
+        "receipt": build_routing_receipt(
+            task_summary=user_message,
+            candidates=available,
+            client=call.client,
+            result=result,
+            source=call.source,
+        ),
     }
     if raw_model and _bare_id(raw_model, prefixes) != _bare_id(model, prefixes):
         verdict["raw_model"] = raw_model
@@ -2434,6 +3024,8 @@ async def route_turn_or_decline(
     """
     try:
         model, verdict = await route_turn(harness, user_message, **kwargs)
+    except RequiredRoutingUnavailable:
+        raise
     except Exception as exc:  # a routing outage must never drop a turn
         _logger.exception("smart_routing: route_turn failed; the turn runs unrouted")
         return None, None, f"Routing call failed: {failure_detail(exc)}"

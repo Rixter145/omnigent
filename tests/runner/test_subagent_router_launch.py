@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import http.client
+import os
 import stat
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from omnigent.cursor_wsl import build_cursor_wsl_argv
 from omnigent.inner.codex_executor import CODEX_EXTENDED_CATALOG_ENV_VAR
 from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
 from omnigent.runner import subagent_routing
@@ -317,6 +319,43 @@ def test_the_claude_spawn_env_never_carries_the_codex_catalog_flag(
     assert CODEX_EXTENDED_CATALOG_ENV_VAR not in env
 
 
+def test_a_routed_cursor_wsl_launch_preserves_auto_smart_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A routed Cursor default is a CLI model, not an omission sentinel."""
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow.load_config",
+        lambda: {"cursor_wsl": {"distro": "Ubuntu-24.04", "user": "ricar"}},
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-wsl"}),
+    )
+    subagent_routing.remember_session_routing_class("conv_spawn_env", _AUTO)
+    try:
+        env = _build_spawn_env_from_spec(
+            spec,
+            "cursor-wsl",
+            cwd=tmp_path,
+            session_id="conv_spawn_env",
+            model_override="auto-smart",
+        )
+    finally:
+        subagent_routing.forget_session_routing_class("conv_spawn_env")
+
+    assert env is not None
+    assert env["HARNESS_CURSOR_WSL_MODEL"] == "auto-smart"
+    argv = build_cursor_wsl_argv(
+        env["HARNESS_CURSOR_WSL_DISTRO"],
+        env["HARNESS_CURSOR_WSL_USER"],
+        env["HARNESS_CURSOR_WSL_CWD"],
+        "review",
+        model=env["HARNESS_CURSOR_WSL_MODEL"],
+    )
+    assert argv[argv.index("--model") + 1] == "auto-smart"
+
+
 async def test_router_env_is_scoped_to_the_launching_harness(tmp_path: Path) -> None:
     """A codex spawn beneath a claude session must not see the codex vars.
 
@@ -418,7 +457,8 @@ def test_advertisement_is_written_owner_only_with_no_leftover_temp(tmp_path: Pat
     path = subagent_routing.write_advertisement(
         tmp_path, url="http://127.0.0.1:1", token="tok", session_id="conv_x"
     )
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
     # A unique temp name is used, so nothing may survive the rename.
     assert [p.name for p in tmp_path.iterdir()] == [path.name]
     subagent_routing.write_advertisement(tmp_path, url="http://127.0.0.1:2", token="tok2")

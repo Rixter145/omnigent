@@ -1012,6 +1012,55 @@ async def test_named_worker_child_of_an_auto_parent_stays_on_its_own_harness(
         assert refreshed.model_override is None
 
 
+async def test_named_worker_can_opt_into_independent_first_message_routing(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A virtual worker may explicitly hand its placeholder harness to the router."""
+    agent = await create_test_agent(
+        client,
+        name="routing-child-named-auto-worker",
+        executor={
+            "type": "omnigent",
+            "config": {"harness": "claude-sdk", "smart_routing_harness": "auto"},
+        },
+        sub_agents=[
+            {
+                "name": "subscription_worker",
+                "executor": {
+                    "type": "omnigent",
+                    "config": {
+                        "harness": "claude-sdk",
+                        "smart_routing_harness": "auto",
+                    },
+                },
+            }
+        ],
+    )
+    parent = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
+    )
+    assert parent.status_code == 201, parent.text
+
+    child = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent.json()["id"],
+            "sub_agent_name": "subscription_worker",
+            "title": "route-this-child",
+        },
+    )
+    assert child.status_code == 201, child.text
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child_conv = conv_store.get_conversation(str(child.json()["id"]))
+    assert child_conv is not None
+    assert child_conv.harness_override == "auto"
+    assert child_conv.labels.get(AUTO_HARNESS_LABEL_KEY) == "1"
+
+
 # ── 7b. The subagent-routing switch is the child-spawn gate ────────
 
 

@@ -1621,7 +1621,12 @@ def register_hooks_routes(
             _stamp_routing_decision_label,
             _unavailable_routing_card,
         )
-        from omnigent.server.smart_routing import route_turn as _route_turn_seam
+        from omnigent.server.smart_routing import (
+            route_turn as _route_turn_seam,
+        )
+        from omnigent.server.smart_routing import (
+            routing_required,
+        )
 
         user_id = _get_user_id(request, auth_provider)
         # LEVEL_EDIT, like POST /events: this route writes ``model_override``
@@ -1692,12 +1697,14 @@ def register_hooks_routes(
 
         async def _pin(model: str) -> bool:
             try:
-                await asyncio.to_thread(
+                updated = await asyncio.to_thread(
                     conversation_store.update_conversation,
                     session_id,
                     model_override=model,
                 )
-            except (OSError, ValueError):
+                if updated is None:
+                    raise RuntimeError("conversation disappeared while pinning route")
+            except Exception:
                 _logger.warning(
                     "route-turn: could not pin model_override for session=%s",
                     session_id,
@@ -1715,8 +1722,26 @@ def register_hooks_routes(
                 verdict,
                 scope=decision_scope(),
                 harness=route_request.harness,
+                require_persisted=False,
             )
-            await _stamp_routing_decision_label(session_id, conversation_store, decision_id)
+            await _stamp_routing_decision_label(
+                session_id,
+                conversation_store,
+                decision_id,
+            )
+
+        async def _commit_required(model: str, verdict: dict[str, Any]) -> None:
+            await _emit_server_routing_decision(
+                session_id,
+                conversation_store,
+                model,
+                verdict,
+                scope=decision_scope(),
+                harness=route_request.harness,
+                require_persisted=True,
+                pin_model_override=model,
+            )
+            _publish_routed_model(session_id, model)
 
         async def _record_decline(cause: str) -> None:
             """Persist the declined chip for a failed routing call.
@@ -1750,7 +1775,12 @@ def register_hooks_routes(
             )
             if decision_id is None:
                 return False
-            await _stamp_routing_decision_label(session_id, conversation_store, decision_id)
+            await _stamp_routing_decision_label(
+                session_id,
+                conversation_store,
+                decision_id,
+                require_persisted=routing_required(),
+            )
             return True
 
         decision = await resolve_turn_route(
@@ -1765,6 +1795,7 @@ def register_hooks_routes(
             reuse_create_route=_reuse_create_route,
             pin=_pin,
             persist=_persist,
+            commit_required=_commit_required,
             record_decline=_record_decline,
         )
         _logger.info(

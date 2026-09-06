@@ -40,6 +40,7 @@ from omnigent_client import (
 from omnigent_client._http import is_loopback_url
 from rich.console import Console
 
+from omnigent._platform import resolve_repo_symlink
 from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE as _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
 )
@@ -3045,6 +3046,7 @@ def _materialize_override_bundle(source: Path, overrides: ChatOverrides) -> Path
     :returns: Path that the server should register — either the
         original *source* or a rewritten copy under a tempdir.
     """
+    source = resolve_repo_symlink(source)
     raw_peek = _load_yaml_if_single_file(source)
     raw_override_peek = _load_yaml_for_override_peek(source)
     needs_fallback = raw_peek is not None and not _spec_declares_harness_or_model(raw_peek)

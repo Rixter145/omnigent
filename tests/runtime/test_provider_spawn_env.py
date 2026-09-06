@@ -48,6 +48,10 @@ from omnigent.spec.types import (
     LLMConfig,
     ProviderAuth,
 )
+from omnigent.subscription_defaults import (
+    CLAUDE_SUBSCRIPTION_DEFAULT,
+    CODEX_SUBSCRIPTION_DEFAULT,
+)
 
 _CATALOG_DEFAULTS = {
     ("anthropic", "claude"): "catalog-anthropic-default",
@@ -97,6 +101,14 @@ def config_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     :returns: The temp directory used as the config home.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    # ``Path.home()`` follows USERPROFILE on Windows even when HOME is set.
+    # Isolate both so the developer's real Claude/Codex subscription detection
+    # cannot shadow the provider fixture and make these tests machine-dependent.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow.codex_cli_effective_auth_mode", lambda: "chatgpt"
+    )
     return tmp_path
 
 
@@ -564,7 +576,7 @@ def test_pi_uses_anthropic_global_default(config_home: Path) -> None:
     assert env["HARNESS_PI_MODEL"] == "claude-default-model"
 
 
-def test_pi_gateway_routing_log_reports_the_resolved_base_url(
+def test_pi_gateway_routing_log_reports_safe_resolved_base_urls(
     config_home: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """
@@ -588,9 +600,108 @@ def test_pi_gateway_routing_log_reports_the_resolved_base_url(
     line = next(
         rec.getMessage() for rec in caplog.records if "gateway routing" in rec.getMessage()
     )
-    # Compare against the env value itself: the line must carry the plural
-    # key's URLs, not just some host substring.
-    assert f"base_url={env['HARNESS_PI_GATEWAY_BASE_URLS']}" in line
+    assert 'base_url={"claude": "https://anthropic.example.com"}' in line
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("https://gateway.example.com:443", "https://gateway.example.com:443"),
+        ("https://gateway.example.com", "https://gateway.example.com"),
+        ("https://anthropic.example.com/v1", "https://anthropic.example.com"),
+        ("http://127.0.0.1:8080", "http://127.0.0.1:8080"),
+        ("https://[2001:db8::1]:8443", "https://[2001:db8::1]:8443"),
+    ],
+)
+def test_gateway_origin_sanitizer_reduces_valid_urls_to_origins(value: str, expected: str) -> None:
+    from omnigent.runner.app import _safe_gateway_origin
+
+    assert _safe_gateway_origin(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ftp://gateway.example.com:443",
+        "sk-secret://gateway.example.com:443",
+        "https+secret://gateway.example.com:443",
+        "https://gateway.example.com:",
+        "https://gateway.example.com:not-a-port",
+        "https://gateway.example.com:65536",
+        "https://gateway example.com:443",
+        "https:// gateway.example.com:443",
+        "https://gateway_example.com:443",
+        "https://gateway.example.com:443\nsecret",
+    ],
+)
+def test_gateway_origin_sanitizer_rejects_unsafe_values_without_echoing(value: str) -> None:
+    from omnigent.runner.app import _safe_gateway_origin
+
+    assert _safe_gateway_origin(value) is None
+
+
+@pytest.mark.parametrize(
+    ("harness", "config", "secret", "origin"),
+    [
+        (
+            "codex",
+            {
+                "providers": {
+                    "vendor-openai": {
+                        "kind": "gateway",
+                        "default": True,
+                        "openai": _key_family(
+                            "https://user:singular-secret@openai.example.com:8443/v1?token=singular-secret#singular-secret",
+                            "sk-oai-secret",
+                            "gpt-default-model",
+                        ),
+                    }
+                }
+            },
+            "singular-secret",
+            "https://openai.example.com:8443",
+        ),
+        (
+            "pi",
+            {
+                "providers": {
+                    "vendor-anthropic": {
+                        "kind": "gateway",
+                        "default": True,
+                        "anthropic": _key_family(
+                            "https://user:plural-secret@anthropic.example.com:9443/v1?token=plural-secret#plural-secret",
+                            "sk-ant-secret",
+                            "claude-default-model",
+                        ),
+                    }
+                }
+            },
+            "plural-secret",
+            "https://anthropic.example.com:9443",
+        ),
+    ],
+)
+def test_gateway_routing_log_rejects_sensitive_url_parts(
+    config_home: Path,
+    caplog: pytest.LogCaptureFixture,
+    harness: str,
+    config: dict[str, object],
+    secret: str,
+    origin: str,
+) -> None:
+    """Gateway routing logs reduce credential-bearing URLs without exposing them."""
+    from omnigent.runner.app import _build_spawn_env_from_spec
+
+    _write_config(config_home, config)
+
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        _build_spawn_env_from_spec(_make_spec(harness=harness), harness)
+
+    line = next(
+        rec.getMessage() for rec in caplog.records if "gateway routing" in rec.getMessage()
+    )
+    assert secret not in line
+    assert origin in line
 
 
 def test_pi_threads_generic_openai_wire_api(config_home: Path) -> None:
@@ -1229,6 +1340,94 @@ def test_codex_subscription_default_pins_builtin_openai(config_home: Path) -> No
     assert env["HARNESS_CODEX_MODEL_PROVIDER"] == "openai"
     # Subscription still emits no gateway transport (the CLI login is auth).
     assert "HARNESS_CODEX_GATEWAY" not in env
+
+
+def test_routed_claude_subscription_sentinel_ignores_gateway_default(
+    config_home: Path,
+) -> None:
+    """A persisted subscription route cannot be rebound to a metered default."""
+
+    _write_config(config_home, _anthropic_default_config())
+    spec = _make_spec(
+        harness="claude-sdk",
+        model=CLAUDE_SUBSCRIPTION_DEFAULT,
+    )
+
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert "HARNESS_CLAUDE_SDK_MODEL" not in env
+    assert "HARNESS_CLAUDE_SDK_API_KEY_HELPER" not in env
+    assert "HARNESS_CLAUDE_SDK_GATEWAY" not in env
+    assert "HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL" not in env
+    assert "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND" not in env
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [
+        ApiKeyAuth(api_key="sk-explicit-must-not-run"),
+        ProviderAuth(name="vendor-anthropic"),
+    ],
+)
+def test_routed_claude_subscription_sentinel_ignores_source_spec_auth(
+    config_home: Path,
+    auth: ApiKeyAuth | ProviderAuth,
+) -> None:
+    """Routing onto a subscription replaces—not merely relabels—spec auth."""
+
+    _write_config(config_home, _anthropic_default_config())
+    spec = _make_spec(
+        harness="claude-sdk",
+        model=CLAUDE_SUBSCRIPTION_DEFAULT,
+        auth=auth,
+    )
+
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert "HARNESS_CLAUDE_SDK_API_KEY_HELPER" not in env
+    assert "HARNESS_CLAUDE_SDK_GATEWAY" not in env
+    assert "HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL" not in env
+    assert "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND" not in env
+
+
+def test_routed_codex_subscription_sentinel_ignores_gateway_default(
+    config_home: Path,
+) -> None:
+    """A persisted ChatGPT route pins built-in OpenAI, never a default gateway."""
+
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(
+        harness="codex",
+        model=CODEX_SUBSCRIPTION_DEFAULT,
+    )
+
+    env = _build_codex_spawn_env(spec, workdir=None)
+
+    assert "HARNESS_CODEX_MODEL" not in env
+    assert env["HARNESS_CODEX_MODEL_PROVIDER"] == "openai"
+    assert "HARNESS_CODEX_GATEWAY" not in env
+    assert "HARNESS_CODEX_GATEWAY_BASE_URL" not in env
+    assert "HARNESS_CODEX_GATEWAY_AUTH_COMMAND" not in env
+
+
+def test_routed_codex_subscription_sentinel_ignores_source_spec_provider(
+    config_home: Path,
+) -> None:
+    """The routed ChatGPT login wins over a provider pinned in the source spec."""
+
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(
+        harness="codex",
+        model=CODEX_SUBSCRIPTION_DEFAULT,
+        auth=ProviderAuth(name="vendor-openai"),
+    )
+
+    env = _build_codex_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CODEX_MODEL_PROVIDER"] == "openai"
+    assert "HARNESS_CODEX_GATEWAY" not in env
+    assert "HARNESS_CODEX_GATEWAY_BASE_URL" not in env
+    assert "HARNESS_CODEX_GATEWAY_AUTH_COMMAND" not in env
 
 
 def test_openai_agents_cli_config_default_fails_loud(config_home: Path) -> None:

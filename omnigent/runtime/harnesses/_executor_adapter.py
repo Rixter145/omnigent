@@ -162,6 +162,17 @@ class ExecutorAdapter(HarnessApp):
         Lazily constructs the executor on the first call; subsequent calls reuse the cached
         instance. Installs stable tool/elicitation/policy bridges once on first use.
         """
+        # Subscription defaults are server-side routing state, never models an
+        # SDK may receive.  The runner normally strips a matched sentinel; if
+        # that routing context was lost, stop here rather than letting an SDK
+        # interpret it as a literal model or fall back to a paid default.
+        from omnigent.subscription_defaults import is_subscription_default_sentinel
+
+        if is_subscription_default_sentinel(request.model_override):
+            raise ValueError(
+                "Subscription routing sentinel reached the executor without a "
+                "resolved transport harness."
+            )
         executor = self._ensure_executor()
         messages = _translate_input_to_messages(request.input)
         # Stamp session_key on every message so the inner executor keys its client consistently,

@@ -285,8 +285,8 @@ describe("resolveThisMachineHostId", () => {
 
 // Workspace validation contract — pins the same shape the server
 // validator enforces (per designs/SESSION_WORKSPACE_SELECTION.md):
-// tilde-prefixed and relative paths are rejected; only
-// fully-absolute paths starting with `/` are accepted. If this
+// tilde-prefixed and relative paths are rejected; POSIX and Windows
+// fully-absolute host paths are accepted. If this
 // drifts out of sync with the server, the submit button would
 // either let through requests the server rejects (opaque 400) or
 // block requests the server would accept (button stuck disabled).
@@ -305,6 +305,11 @@ describe("isValidWorkspace", () => {
     // Browsers paste with stray whitespace; trim must run before
     // the shape check or "  /Users/corey  " would be rejected.
     expect(isValidWorkspace("  /Users/corey  ")).toBe(true);
+  });
+
+  it("accepts absolute Windows drive paths", () => {
+    expect(isValidWorkspace("C:\\Users\\corey\\projects\\myapp")).toBe(true);
+    expect(isValidWorkspace("  D:/work/repo  ")).toBe(true);
   });
 
   it("rejects empty string", () => {
@@ -348,6 +353,13 @@ describe("normalizeWorkspacePath", () => {
     // Root is preserved, not collapsed away.
     ["/", "/"],
     ["///", "/"],
+    // Windows path equality is separator- and case-insensitive. Drive roots
+    // retain their slash so the normalized value remains absolute.
+    ["C:\\Repo\\", "c:/repo"],
+    ["c:/repo///", "c:/repo"],
+    ["  D:\\Work\\Project  ", "d:/work/project"],
+    ["C:\\", "c:/"],
+    ["c:/", "c:/"],
     // Blank → null (no path) — must NOT become "/", or an empty input would
     // spuriously match a session whose workspace is the root.
     ["", null],
@@ -372,6 +384,14 @@ describe("sessionsSharingDirectory", () => {
     conv({ id: "d", host_id: "host_1", workspace: "/other" }), // wrong dir
     conv({ id: "e", host_id: "host_1", workspace: null }), // no workspace
   ];
+
+  it("matches Windows workspace case, separator, and trailing-slash variants", () => {
+    const sessions = [conv({ id: "win", host_id: "host_1", workspace: "C:\\Repo\\Project\\" })];
+
+    expect(sessionsSharingDirectory(sessions, "host_1", "c:/repo/project", () => true)).toEqual(
+      sessions,
+    );
+  });
 
   const cases: {
     name: string;
@@ -684,6 +704,10 @@ describe("matchSkillInvocation", () => {
 
 function host(status: "online" | "offline", i = 1): Host {
   return { host_id: `host_${i}`, name: `machine-${i}`, owner: "me", status };
+}
+
+function thisMachineLabel(): string {
+  return displayNameForHost(host("online"), "host_1", navigator.userAgent);
 }
 
 function mockHosts(hosts: Host[], queryState: Partial<ReturnType<typeof useHosts>> = {}) {
@@ -2538,19 +2562,16 @@ describe("NewChatLandingScreen", () => {
     // The sandbox option is pinned FIRST in the menu, above the host list —
     // DOCUMENT_POSITION_FOLLOWING means the host item comes after it.
     const sandboxOption = screen.getByTestId("new-chat-landing-sandbox-option");
-    const hostItem = screen
-      .getAllByText("This machine")
-      .find((el) => el.closest('[role="menuitem"]') !== null);
-    expect(hostItem).toBeTruthy();
+    const hostItem = screen.getByTestId("new-chat-landing-host-host_1");
     expect(
-      sandboxOption.compareDocumentPosition(hostItem!) & Node.DOCUMENT_POSITION_FOLLOWING,
+      sandboxOption.compareDocumentPosition(hostItem) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     // Picking the host restores the workspace flow (file-browser chip,
     // worktree chip) — the sandbox default doesn't wedge the normal path.
-    fireEvent.click(hostItem!);
+    fireEvent.click(hostItem);
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
+        thisMachineLabel(),
       ),
     );
     expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy();
@@ -3812,14 +3833,11 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    const hostItem = screen
-      .getAllByText("This machine")
-      .find((el) => el.closest('[role="menuitem"]') !== null);
-    expect(hostItem).toBeTruthy();
-    fireEvent.click(hostItem!);
+    const hostItem = screen.getByTestId("new-chat-landing-host-host_1");
+    fireEvent.click(hostItem);
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
+        thisMachineLabel(),
       ),
     );
     // With no custom agents yet, the create item is a top-level row (no
@@ -3839,13 +3857,11 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    const hostItem = screen
-      .getAllByText("This machine")
-      .find((el) => el.closest('[role="menuitem"]') !== null);
-    fireEvent.click(hostItem!);
+    const hostItem = screen.getByTestId("new-chat-landing-host-host_1");
+    fireEvent.click(hostItem);
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
+        thisMachineLabel(),
       ),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });

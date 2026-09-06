@@ -3854,6 +3854,68 @@ async def test_relay_routing_decision_live_event_carries_persisted_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_required_relay_stops_when_routing_receipt_cannot_persist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Required routing must not relay assistant output after a receipt failure."""
+    from types import SimpleNamespace
+
+    from omnigent.server.routes.sessions import _relay_runner_stream
+    from omnigent.server.smart_routing import RoutingSettings
+
+    store = _ConversationStore()
+    original_append = store.append
+
+    def fail_routing_item(session_id: str, items: list[Any]) -> Any:
+        if items and items[0].type == "routing_decision":
+            raise OSError("store unavailable")
+        return original_append(session_id, items)
+
+    store.append = fail_routing_item  # type: ignore[method-assign]
+    client = _FakeStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "routing_decision",
+                        "model": "gpt-subscription-default",
+                        "applied": True,
+                        "rationale": "subscription judge pick",
+                    },
+                }
+            ),
+            _sse_frame(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "must not persist"}],
+                        "agent": "gpt-subscription-default",
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+    monkeypatch.setattr(
+        _globals,
+        "_caps",
+        SimpleNamespace(routing_settings=RoutingSettings(provider="subscription", required=True)),
+    )
+
+    with pytest.raises(RuntimeError, match="receipt could not be persisted"):
+        await _relay_runner_stream(
+            "79b22ebd2309e48fdeb450c65611d51b",
+            client,
+            store,  # type: ignore[arg-type]
+        )
+
+    assert not any(item.type == "message" for item in store.appended_items)
+
+
+@pytest.mark.asyncio
 async def test_relay_drops_malformed_routing_decision() -> None:
     """A malformed routing item (empty model) is dropped, not persisted.
 
@@ -5708,7 +5770,13 @@ async def test_offline_environment_advertises_the_same_reach_as_the_runner(
     assert metadata["root"] == _OFFLINE_WORKSPACE
     assert metadata["reachable"] == {
         "unconfined": True,
-        "roots": [{"path": _OFFLINE_WORKSPACE, "access": "write", "origin": "cwd"}],
+        "roots": [
+            {
+                "path": str(Path(_OFFLINE_WORKSPACE).resolve()),
+                "access": "write",
+                "origin": "cwd",
+            }
+        ],
     }
 
 

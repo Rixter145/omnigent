@@ -162,6 +162,7 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
 # short-circuits to a subscription-style readout instead of reporting the
 # harness as having "no model-provider resolution".
 _CURSOR_HARNESSES: frozenset[str] = frozenset({"cursor", "cursor-native", "native-cursor"})
+_CURSOR_WSL_HARNESSES: frozenset[str] = frozenset({"cursor-wsl"})
 
 # Preferred inline family per single-family harness (pi consumes both).
 _KEY_AUTH_FAMILY: dict[str, str] = {
@@ -393,6 +394,8 @@ def model_family_token(model_id: str) -> str:
     """
     if "claude" in model_id.lower():
         return "claude"
+    if "gemini" in model_id.lower():
+        return "gemini"
     if is_codex_compatible_model(model_id):
         return "openai"
     return "other"
@@ -601,6 +604,10 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
     # consumed from the runner's dispatch path.
     from omnigent.runtime.workflow import _resolve_provider_for_build
 
+    if (harness or "") in _CURSOR_WSL_HARNESSES:
+        return ResolvedModelProvider(
+            kind=SUBSCRIPTION_KIND, cli="cursor-wsl", detail="Cursor CLI login in WSL"
+        )
     if (harness or "") in _CURSOR_HARNESSES:
         return ResolvedModelProvider(
             kind=SUBSCRIPTION_KIND, cli="cursor-agent", detail="cursor-agent CLI login"

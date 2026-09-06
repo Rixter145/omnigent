@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import hmac
+import json
 import logging
 import os
 import secrets
 import shutil
 import signal
-import socket
 import sys
 import tempfile
 import time
@@ -48,8 +50,19 @@ from omnigent.runtime.harnesses._harness_zygote_client import (
     HarnessZygoteClient,
     ZygoteHarnessUnavailable,
 )
+from omnigent.subscription_security import (
+    is_subscription_unsafe_env_name,
+    subscription_environment,
+    subscription_transport,
+)
 
 _logger = logging.getLogger(__name__)
+
+# The launch cache must notice credential rotation without retaining any
+# credential-bearing launch value.  Keep this key process-local: cache entries
+# cannot be correlated across restarts, and their fingerprints cannot be used
+# to test values outside this runner process.
+_LAUNCH_IDENTITY_KEY = secrets.token_bytes(32)
 
 # Per-AP-instance directory holding all per-conversation Unix
 # sockets (POSIX) and the AP_PID sentinel file. Each Omnigent instance gets a
@@ -81,6 +94,71 @@ _TMP_PARENT_ENV_VAR = "OMNIGENT_HARNESS_TMP_PARENT"
 # reachable by any local process; on POSIX (uid-isolated UDS) it is defence in
 # depth.
 _HARNESS_AUTH_TOKEN_ENV = "OMNIGENT_HARNESS_AUTH_TOKEN"
+# One-shot control-plane proof used only while a Windows runner reports its
+# kernel-selected loopback port. It intentionally reuses the per-spawn bearer:
+# no unauthenticated listener can nominate a port that will receive that bearer.
+_HARNESS_READY_TOKEN_ENV = "OMNIGENT_HARNESS_READY_TOKEN"
+
+# Internal spawn-env marker.  Subscription CLI logins must be isolated from
+# inherited gateway and key configuration before the child is launched.  The
+# marker is consumed by :func:`_build_harness_spawn_env`; it is never exposed
+# to the harness process.
+_HARNESS_SUBSCRIPTION_AUTH_ENV = "OMNIGENT_HARNESS_SUBSCRIPTION_AUTH"
+# Non-secret bridge to the Claude SDK harness. This is distinct from the
+# private routing marker above, which must not leave the process manager.
+_HARNESS_CLAUDE_SDK_SUBSCRIPTION_ISOLATION_ENV = "HARNESS_CLAUDE_SDK_SUBSCRIPTION_ISOLATION"
+
+_SUBSCRIPTION_AUTH_IDENTITY_KEYS = frozenset({"CLAUDE_CODE_OAUTH_TOKEN", "CODEX_HOME"})
+
+
+def _is_subscription_harness_auth_key(key: str) -> bool:
+    """Whether *key* can redirect a Claude or Codex subscription launch."""
+    return is_subscription_unsafe_env_name(key)
+
+
+def _is_subscription_transport_key(key: str) -> bool:
+    """Whether *key* can redirect a subscription CLI onto metered transport."""
+    return is_subscription_unsafe_env_name(key)
+
+
+def _is_intentional_subscription_env(key: str, value: str) -> bool:
+    """Keep only the Codex built-in pin among otherwise stripped transport keys."""
+    return key == "HARNESS_CODEX_MODEL_PROVIDER" and value == "openai"
+
+
+def _is_transport_identity_key(key: str) -> bool:
+    """Whether a non-model variable participates in launch transport selection."""
+    if key in _SUBSCRIPTION_AUTH_IDENTITY_KEYS or _is_subscription_transport_key(key):
+        return True
+    for prefix in ("HARNESS_CLAUDE_SDK_", "HARNESS_CODEX_"):
+        if key.startswith(prefix):
+            suffix = key.removeprefix(prefix)
+            return suffix in {
+                "MODEL_PROVIDER",
+                "GATEWAY",
+                "BASE_URL",
+                "API_KEY",
+                "API_KEY_HELPER",
+                "DATABRICKS_PROFILE",
+                "SUBSCRIPTION_ISOLATION",
+            } or suffix.startswith(("GATEWAY_", "AUTH_"))
+    return False
+
+
+def _credential_blind_identity_value(key: str, value: str) -> str:
+    """Fingerprint a launch value without retaining or logging its contents.
+
+    URLs are no exception: userinfo, query strings, and path segments can all
+    carry credentials.  Hash every transport value so identity changes still
+    invalidate a cached subprocess while the cache is safe to render.
+    """
+    digest = hmac.new(
+        _LAUNCH_IDENTITY_KEY,
+        f"{key}\0{value}".encode("utf-8", "surrogatepass"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"<fingerprint:{digest}>"
+
 
 # Sentinel file the Omnigent instance writes into its subdir on boot. The
 # orphan sweep uses it to tell whether a sibling subdir belongs to
@@ -346,17 +424,93 @@ async def _can_connect_uds(socket_path: Path) -> bool:
     return True
 
 
-def _pick_free_tcp_port() -> int:
-    """Bind 127.0.0.1:0 to let the OS choose a free port, then release it.
+class _TcpReadyHandoff:
+    """One-shot, authenticated runner-to-parent TCP endpoint handoff."""
 
-    The standard allocation trick: the OS guarantees the port is free at the
-    moment of bind. A small TOCTOU window exists before the runner re-binds it,
-    but loopback collisions are vanishingly rare and ``_wait_for_bind`` fails
-    loud if the child cannot bind.
-    """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        return int(probe.getsockname()[1])
+    _READ_TIMEOUT_S = 1.0
+
+    def __init__(self, token: str, conversation_id: str) -> None:
+        self._token = token
+        self._conversation_id = conversation_id
+        self._port: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+        self._server: asyncio.AbstractServer | None = None
+
+    @classmethod
+    async def create(cls, token: str, conversation_id: str) -> _TcpReadyHandoff:
+        handoff = cls(token, conversation_id)
+        handoff._server = await asyncio.start_server(handoff._accept, "127.0.0.1", 0)
+        return handoff
+
+    @property
+    def endpoint(self) -> str:
+        assert self._server is not None
+        host, port = self._server.sockets[0].getsockname()[:2]
+        return f"{host}:{port}"
+
+    async def _accept(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            raw = await asyncio.wait_for(reader.readline(), timeout=self._READ_TIMEOUT_S)
+            payload = json.loads(raw)
+            port = payload.get("port") if isinstance(payload, dict) else None
+            valid = (
+                isinstance(port, int)
+                and 0 < port <= 65535
+                and isinstance(payload.get("pid"), int)
+                and payload.get("conversation_id") == self._conversation_id
+                and hmac.compare_digest(str(payload.get("token", "")), self._token)
+            )
+            if valid:
+                if not self._port.done():
+                    self._port.set_result(port)
+                writer.write(b"ok\n")
+            else:
+                writer.write(b"rejected\n")
+            await writer.drain()
+        except (OSError, ValueError, json.JSONDecodeError, asyncio.TimeoutError):
+            pass
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+
+    async def wait_for_port(
+        self,
+        process: asyncio.subprocess.Process | Any,
+        harness: str,
+        conversation_id: str,
+    ) -> int:
+        """Wait for the single authenticated handoff, or fail like bind readiness."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _SPAWN_READY_TIMEOUT_S
+        while True:
+            if process.returncode is not None:
+                raise RuntimeError(
+                    f"harness {harness!r} for conversation {conversation_id!r} exited with "
+                    f"{process.returncode} during spawn (see Omnigent stderr)"
+                )
+            timeout = min(_SPAWN_POLL_INTERVAL_S, max(0.0, deadline - loop.time()))
+            try:
+                return await asyncio.wait_for(asyncio.shield(self._port), timeout=timeout)
+            except asyncio.TimeoutError:
+                if loop.time() >= deadline:
+                    process.kill()
+                    await process.wait()
+                    raise RuntimeError(
+                        f"harness {harness!r} for conversation {conversation_id!r} did not "
+                        f"complete its authenticated readiness handoff within "
+                        f"{_SPAWN_READY_TIMEOUT_S:.0f}s"
+                    ) from None
+
+    async def aclose(self) -> None:
+        """Stop accepting readiness records once spawn settles."""
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
 
 
 async def _can_connect_tcp(host: str, port: int) -> bool:
@@ -395,7 +549,9 @@ class _HarnessEndpoint:
     def create(cls, instance_dir: Path, conversation_id: str) -> _HarnessEndpoint:
         """Allocate the platform-appropriate endpoint for a conversation."""
         if IS_WINDOWS:
-            return cls(host="127.0.0.1", port=_pick_free_tcp_port())
+            # The runner owns the port allocation. The parent learns the
+            # selected port only from its authenticated readiness handoff.
+            return cls(host="127.0.0.1")
         return cls(socket_path=_socket_path(instance_dir, conversation_id))
 
     @property
@@ -406,7 +562,13 @@ class _HarnessEndpoint:
         """The ``_runner`` CLI flags selecting this transport."""
         if self.socket_path is not None:
             return ["--socket", str(self.socket_path)]
-        return ["--bind", f"{self.host}:{self.port}"]
+        return ["--bind", f"{self.host}:0"]
+
+    def set_tcp_port(self, port: int) -> None:
+        """Record the authenticated child-selected loopback port exactly once."""
+        if self.socket_path is not None or self.port is not None:
+            raise RuntimeError("harness endpoint was already assigned")
+        self.port = port
 
     def make_transport(self) -> httpx.AsyncBaseTransport:
         """An httpx transport routed at this endpoint."""
@@ -419,6 +581,7 @@ class _HarnessEndpoint:
         """The httpx base URL. Under UDS the host is cosmetic; under TCP it routes."""
         if self.socket_path is not None:
             return "http://harness.local"
+        assert self.port is not None
         return f"http://{self.host}:{self.port}"
 
     async def can_connect(self) -> bool:
@@ -470,12 +633,17 @@ class _SubprocessEntry:
         endpoint: _HarnessEndpoint,
         harness: str,
         model: str | None = None,
+        launch_identity: tuple[tuple[str, str], ...] = (),
     ) -> None:
         self.process = process
         self.client = client
         self.endpoint = endpoint
         self.harness = harness
         self.model = model
+        # Credential-blind summary of the child launch contract.  This lets a
+        # routed subscription replace an eager gateway process even though its
+        # model sentinel deliberately does not become a CLI model flag.
+        self.launch_identity = launch_identity
         self.last_used_at: float = 0.0
 
 
@@ -515,8 +683,46 @@ def _build_harness_spawn_env(env: dict[str, str] | None) -> dict[str, str]:
         ``None`` means no overrides.
     :returns: The harness subprocess environment, runner-auth secrets removed.
     """
-    merged = {**os.environ, **env} if env else dict(os.environ)
+    requested = dict(env or {})
+    subscription_marker = requested.pop(_HARNESS_SUBSCRIPTION_AUTH_ENV, None)
+    subscription_auth = subscription_marker is not None
+    selected_transport = subscription_transport(subscription_marker)
+    merged = dict(os.environ)
+    if subscription_auth:
+        # Scrub both ambient state and caller-supplied overrides.  The latter
+        # matters when a previously built gateway env is retried with a routed
+        # subscription marker.  Claude OAuth and Codex home/login state do not
+        # match these transport keys and therefore remain available to the CLI.
+        merged = subscription_environment(merged, transport=selected_transport)
+        requested = subscription_environment(requested, transport=selected_transport)
+        if selected_transport == "codex":
+            requested["HARNESS_CODEX_MODEL_PROVIDER"] = "openai"
+        elif selected_transport == "claude-sdk":
+            # Empty setting sources suppress user/project/local settings
+            # without disabling the Claude subscription OAuth login.
+            requested[_HARNESS_CLAUDE_SDK_SUBSCRIPTION_ISOLATION_ENV] = "1"
+    merged.update(requested)
     return strip_runner_auth_secrets(merged)
+
+
+def _launch_identity(env: dict[str, str] | None) -> tuple[tuple[str, str], ...]:
+    """Return a deterministic, credential-blind launch identity for ``env``.
+
+    Only selected transport/auth variables can affect the eager SDK process's
+    transport. Their values are process-local fingerprints, so the cached
+    entry cannot disclose credentials while key/helper/auth-command rotation
+    still invalidates the process. Models stay out of this identity because
+    the existing model-switch path deliberately handles live-config harnesses.
+    """
+    effective_env = _build_harness_spawn_env(env)
+    relevant = {
+        key: value for key, value in effective_env.items() if _is_transport_identity_key(key)
+    }
+    return tuple(
+        sorted(
+            (key, _credential_blind_identity_value(key, value)) for key, value in relevant.items()
+        )
+    )
 
 
 class HarnessProcessManager:
@@ -803,12 +1009,16 @@ class HarnessProcessManager:
                 await self._close_entry(entry)
                 entry = None
                 respawn_reason = "harness_respawn_agent_switch"
-            if entry is not None and harness not in _LIVE_MODEL_CONFIG_HARNESSES:
+            if (
+                entry is not None
+                and harness != "any"
+                and harness not in _LIVE_MODEL_CONFIG_HARNESSES
+            ):
                 # Most harnesses bake the model into the subprocess env. A
                 # later concrete model change must respawn them; ACP harnesses
                 # in the live-config set instead apply the request in-session.
                 requested_model = (env or {}).get(_model_env_key(harness))
-                if requested_model is not None and requested_model != entry.model:
+                if requested_model != entry.model:
                     _logger.info(
                         "harness %s for conversation %s: model changed %r -> %r; respawning",
                         harness,
@@ -820,6 +1030,23 @@ class HarnessProcessManager:
                     await self._close_entry(entry)
                     entry = None
                     respawn_reason = "harness_respawn_model_switch"
+            if entry is not None and harness != "any":
+                requested_identity = _launch_identity(env)
+                if requested_identity != entry.launch_identity:
+                    # SDK harnesses are eager: a session-create process can
+                    # predate the first Smart Routing decision.  In particular,
+                    # subscription sentinels intentionally omit CLI model flags,
+                    # so model-only invalidation cannot distinguish the prior
+                    # gateway process from the subscription login transport.
+                    _logger.info(
+                        "harness %s for conversation %s: launch transport changed; respawning",
+                        harness,
+                        conversation_id,
+                    )
+                    replaced_response_id = self._in_flight_response_ids.get(conversation_id)
+                    await self._close_entry(entry)
+                    entry = None
+                    respawn_reason = "harness_respawn_transport_auth_switch"
             if entry is None:
                 if harness == "any":
                     raise NoLiveHarnessError(
@@ -1205,9 +1432,12 @@ class HarnessProcessManager:
         # scaffold's auth gate inert. The token is delivered via the harness's
         # private env and presented by our client (below) on every /v1 request.
         auth_token: str | None = None
+        ready_handoff: _TcpReadyHandoff | None = None
         if IS_WINDOWS:
             auth_token = secrets.token_urlsafe(32)
             effective_env[_HARNESS_AUTH_TOKEN_ENV] = auth_token
+            effective_env[_HARNESS_READY_TOKEN_ENV] = auth_token
+            ready_handoff = await _TcpReadyHandoff.create(auth_token, conversation_id)
 
         parent_pid = os.getpid()
 
@@ -1227,13 +1457,23 @@ class HarnessProcessManager:
             "--module",
             module_path,
             *endpoint.spawn_args(),
+            *(["--ready-endpoint", ready_handoff.endpoint] if ready_handoff else []),
             "--conversation-id",
             conversation_id,
             "--parent-pid",
             str(parent_pid),
         ]
-        process = await self._spawn_harness_process(runner_argv, effective_env)
         try:
+            process = await self._spawn_harness_process(runner_argv, effective_env)
+        except BaseException:
+            if ready_handoff is not None:
+                await ready_handoff.aclose()
+            raise
+        try:
+            if ready_handoff is not None:
+                endpoint.set_tcp_port(
+                    await ready_handoff.wait_for_port(process, harness, conversation_id)
+                )
             await _wait_for_bind(process, endpoint, harness, conversation_id)
 
             # ``base_url`` is required for relative-URL routing; the
@@ -1268,6 +1508,7 @@ class HarnessProcessManager:
                 # triggers a respawn in ``get_client`` — the model is a fixed
                 # process env var, not re-read per turn.
                 model=(env or {}).get(_model_env_key(harness)),
+                launch_identity=_launch_identity(env),
             )
         except BaseException:
             # From spawn onward the process must have exactly one owner:
@@ -1289,6 +1530,10 @@ class HarnessProcessManager:
             with contextlib.suppress(Exception):
                 endpoint.cleanup()
             raise
+        finally:
+            if ready_handoff is not None:
+                with contextlib.suppress(Exception):
+                    await ready_handoff.aclose()
 
     async def _spawn_harness_process(
         self,

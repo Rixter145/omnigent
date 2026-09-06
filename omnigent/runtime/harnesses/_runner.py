@@ -45,8 +45,10 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import os
 import signal
+import socket
 import sys
 import threading
 import time
@@ -66,6 +68,11 @@ from omnigent.runner._zygote import ZYGOTE_HARNESS_FORKED_ENV_VAR
 # their own structured logs); set to ``"info"`` if you need to
 # debug the request/response flow at the HTTP layer.
 _UVICORN_LOG_LEVEL = "warning"
+
+# Parent-only readiness proof for Windows' ephemeral loopback listener. Kept in
+# the private spawn environment rather than argv so another local process
+# cannot nominate a port that receives the harness bearer.
+_HARNESS_READY_TOKEN_ENV = "OMNIGENT_HARNESS_READY_TOKEN"
 
 # Hard ceiling on uvicorn's graceful-shutdown phase. After SIGTERM,
 # uvicorn waits at most this many seconds for active connections
@@ -299,6 +306,65 @@ class _HardExitServer(uvicorn.Server):
         super().handle_exit(sig, frame)
 
 
+def _notify_parent_ready(
+    endpoint: str,
+    conversation_id: str,
+    port: int,
+) -> None:
+    """Report the runner-owned ephemeral port to the parent exactly once."""
+    token = os.environ.get(_HARNESS_READY_TOKEN_ENV)
+    if not token:
+        raise RuntimeError("runner readiness token is missing")
+    host, separator, raw_port = endpoint.rpartition(":")
+    if not separator:
+        raise ValueError("runner readiness endpoint must be host:port")
+    payload = (
+        json.dumps(
+            {
+                "conversation_id": conversation_id,
+                "pid": os.getpid(),
+                "port": port,
+                "token": token,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    with socket.create_connection((host, int(raw_port)), timeout=5.0) as connection:
+        connection.sendall(payload)
+        if connection.recv(16) != b"ok\n":
+            raise RuntimeError("parent rejected runner readiness handoff")
+
+
+class _ReadyServer(_HardExitServer):
+    """Uvicorn server that reports its kernel-selected TCP port after startup."""
+
+    def __init__(self, config: uvicorn.Config, endpoint: str, conversation_id: str) -> None:
+        super().__init__(config)
+        self._ready_endpoint = endpoint
+        self._conversation_id = conversation_id
+
+    async def startup(self, sockets: list[socket.socket] | None = None) -> None:
+        await super().startup(sockets=sockets)
+        if not self.started:
+            return
+        try:
+            for server in self.servers:
+                for listener in server.sockets or ():
+                    address = listener.getsockname()
+                    if isinstance(address, tuple) and len(address) >= 2:
+                        _notify_parent_ready(
+                            self._ready_endpoint,
+                            self._conversation_id,
+                            int(address[1]),
+                        )
+                        return
+            raise RuntimeError("uvicorn did not expose a TCP listener")
+        except Exception as exc:
+            print(f"runner: readiness handoff failed: {exc}", file=sys.stderr, flush=True)
+            self.should_exit = True
+
+
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     """
     Parse the runner's required CLI arguments.
@@ -344,6 +410,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ready-endpoint",
+        default=None,
+        help="Parent loopback endpoint for authenticated TCP readiness handoff.",
+    )
+    parser.add_argument(
         "--conversation-id",
         required=True,
         help="AP-allocated conversation id (e.g. 'conv_abc123').",
@@ -358,7 +429,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "on parent exit."
         ),
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.ready_endpoint is not None and args.bind is None:
+        parser.error("--ready-endpoint requires --bind")
+    return args
 
 
 def _create_uvicorn_config(
@@ -461,7 +535,10 @@ def main(argv: list[str] | None = None) -> None:
             _set_pdeathsig()
         _start_parent_watchdog(args.parent_pid)
     config = _create_uvicorn_config(app, args.socket, args.bind)
-    _HardExitServer(config).run()
+    if args.ready_endpoint is not None:
+        _ReadyServer(config, args.ready_endpoint, args.conversation_id).run()
+    else:
+        _HardExitServer(config).run()
 
 
 if __name__ == "__main__":

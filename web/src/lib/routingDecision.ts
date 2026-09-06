@@ -8,6 +8,23 @@
 /** Where a routing decision was taken. Optional; legacy rows omit it. */
 export type RoutingScope = "session" | "turn" | "child_session" | "native_subagent";
 
+/** Credential-blind additive routing audit data. Unknown future fields are preserved. */
+export interface RoutingDecisionReceipt {
+  task_summary?: string | null;
+  candidates?: Record<string, unknown>;
+  readiness?: Record<string, unknown>;
+  judge_provider?: string | null;
+  judge_model?: string | null;
+  attempts?: Record<string, unknown>[];
+  rationale?: string | null;
+  validation?: unknown;
+  final_route?: Record<string, unknown> | null;
+  fallback_chain?: string[];
+  user_override?: string | null;
+  selection_mode?: string | null;
+  [key: string]: unknown;
+}
+
 export interface RoutingDecisionExtras {
   /** Harness the decision routes to, e.g. `"claude-native"`. */
   harness?: string | null;
@@ -21,6 +38,8 @@ export interface RoutingDecisionExtras {
   attemptedOverride?: string | null;
   /** Which router answered — `"databricks-aigw"` or `"oss-llm"`; absent on legacy rows. */
   routerSource?: string | null;
+  /** Bounded candidate/judge/validation receipt, absent on legacy rows. */
+  receipt?: RoutingDecisionReceipt | null;
 }
 
 const SCOPES = new Set<string>(["session", "turn", "child_session", "native_subagent"]);
@@ -45,6 +64,7 @@ function str(value: unknown): string | undefined {
  */
 export function routingExtrasFromWire(rec: Record<string, unknown>): RoutingDecisionExtras {
   const scope = str(rec.scope);
+  const receipt = rec.receipt;
   return {
     ...(str(rec.harness) !== undefined && { harness: str(rec.harness) }),
     ...(scope !== undefined && SCOPES.has(scope) && { scope: scope as RoutingScope }),
@@ -54,6 +74,9 @@ export function routingExtrasFromWire(rec: Record<string, unknown>): RoutingDeci
       attemptedOverride: str(rec.attempted_override),
     }),
     ...(str(rec.router_source) !== undefined && { routerSource: str(rec.router_source) }),
+    ...(receipt != null && typeof receipt === "object" && !Array.isArray(receipt)
+      ? { receipt: receipt as RoutingDecisionReceipt }
+      : {}),
   };
 }
 
@@ -75,6 +98,7 @@ export function routingExtras(
     ...(source.rawModel != null && { rawModel: source.rawModel }),
     ...(source.attemptedOverride != null && { attemptedOverride: source.attemptedOverride }),
     ...(source.routerSource != null && { routerSource: source.routerSource }),
+    ...(source.receipt != null && { receipt: source.receipt }),
   };
 }
 

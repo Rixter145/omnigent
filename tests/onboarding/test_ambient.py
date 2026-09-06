@@ -990,3 +990,32 @@ def test_claude_managed_gateway_first_readable_file_decides(clean_env, monkeypat
     low.write_text(json.dumps(_ISAAC_CLAUDE_SETTINGS))
     monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (high, low))
     assert ambient.claude_managed_gateway() == (None, False)
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"apiKEYhelper": "secret-command"}, ("managed api-key helper",)),
+        (
+            {"ENV": {"anthropic_base_url": "https://private.invalid"}},
+            ("managed Anthropic base URL",),
+        ),
+        ({"env": {"claude_code_use_gateway": "TRUE"}}, ("managed gateway",)),
+        ({"env": {"CLAUDE_CODE_USE_BEDROCK": "yes"}}, ("managed Bedrock provider",)),
+        (
+            {"env": {"anthropic_vertex_project_id": "private-project"}},
+            ("managed Vertex provider",),
+        ),
+        ({"env": {"MCP_TOOL_TIMEOUT": "1"}}, ()),
+    ],
+)
+def test_claude_managed_subscription_conflicts_are_classified_without_values(
+    clean_env, monkeypatch, payload: object, expected: tuple[str, ...]
+) -> None:
+    """Only provider/auth contracts conflict; diagnostics reveal no setting values."""
+    _write_managed_settings(clean_env, monkeypatch, payload)
+
+    conflicts = ambient.claude_managed_subscription_conflicts()
+
+    assert conflicts == expected
+    assert "private" not in " ".join(conflicts)

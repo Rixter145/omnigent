@@ -37,6 +37,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms import Client as LLMClient
 from omnigent.model_catalog import resolve_catalog_model
 from omnigent.model_resolver import ModelResolutionError
+from omnigent.onboarding.ambient import codex_cli_effective_auth_mode
 from omnigent.onboarding.databricks_config import (
     get_workspace_url_for_profile,
 )
@@ -76,6 +77,7 @@ from omnigent.runtime.compaction import (
     count_tokens,
 )
 from omnigent.runtime.content_resolver import resolve_content_references
+from omnigent.runtime.harnesses.process_manager import _HARNESS_SUBSCRIPTION_AUTH_ENV
 from omnigent.runtime.prompt import build_instructions, history_to_input_items
 from omnigent.spec import AgentSpec
 from omnigent.spec.parser import check_unresolved_env_vars
@@ -87,6 +89,7 @@ from omnigent.spec.types import (
     RetryPolicy,
 )
 from omnigent.stores import ConversationStore
+from omnigent.subscription_security import subscription_marker
 
 # ── Module-level constants ────────────────────────────────────
 
@@ -1183,7 +1186,16 @@ def _build_claude_sdk_spawn_env(
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
     env: dict[str, str] = {}
-    model = _resolve_spec_model(spec)
+    from omnigent.subscription_defaults import (
+        provider_default_transport_model,
+        subscription_default_model,
+    )
+
+    raw_model = _resolve_spec_model(spec)
+    subscription_selected = raw_model == subscription_default_model("claude-sdk")
+    if subscription_selected:
+        env[_HARNESS_SUBSCRIPTION_AUTH_ENV] = subscription_marker("claude-sdk")
+    model = provider_default_transport_model("claude-sdk", raw_model)
     if model is not None:
         # Specs may pin the provider-routed spelling ("anthropic/<name>") so
         # generic clients route correctly, but the claude CLI rejects
@@ -1207,10 +1219,18 @@ def _build_claude_sdk_spawn_env(
     #    no auth at all (same guard as openai-agents to prevent global defaults
     #    from silently overriding YAML-declared legacy profiles).
     # 4. Auto-Databricks: databricks-* model prefix triggers Databricks routing.
-    provider = _resolve_provider_for_build(spec, harness_type="claude-sdk", for_launch=True)
+    # A Smart Routing subscription sentinel is also the durable auth provenance
+    # for this launch.  It must outrank the original agent spec and mutable
+    # machine defaults: otherwise a routed subscription receipt could execute
+    # through an API key or gateway configured on the source bundle.
+    provider = (
+        None
+        if subscription_selected
+        else _resolve_provider_for_build(spec, harness_type="claude-sdk", for_launch=True)
+    )
     if provider is not None:
         configure_agent_harness_with_provider(env, provider, harness_type="claude-sdk")
-    else:
+    elif not subscription_selected:
         # No provider resolved → the only remaining credential is an ApiKeyAuth
         # (spec ``executor.auth`` or the global ``auth:`` block). The databricks /
         # legacy-profile / databricks-model cases were folded into the
@@ -1333,7 +1353,21 @@ def _build_codex_spawn_env(
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
     env: dict[str, str] = {}
-    model = _resolve_spec_model(spec)
+    from omnigent.subscription_defaults import (
+        provider_default_transport_model,
+        subscription_default_model,
+    )
+
+    raw_model = _resolve_spec_model(spec)
+    subscription_selected = raw_model == subscription_default_model("codex")
+    if subscription_selected:
+        if codex_cli_effective_auth_mode() != "chatgpt":
+            raise OmnigentError(
+                "Codex subscription routing requires a ChatGPT login.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        env[_HARNESS_SUBSCRIPTION_AUTH_ENV] = subscription_marker("codex")
+    model = provider_default_transport_model("codex", raw_model)
     if model is not None:
         env["HARNESS_CODEX_MODEL"] = model
 
@@ -1342,8 +1376,19 @@ def _build_codex_spawn_env(
     # declares no auth — the per-family global default. See
     # :func:`_resolve_provider_for_build`. Otherwise the existing path is
     # unchanged.
-    provider = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
-    if provider is not None:
+    # The persisted subscription sentinel binds execution to the ChatGPT-login
+    # transport even if the source spec or machine later resolves a gateway.
+    provider = (
+        None
+        if subscription_selected
+        else _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
+    )
+    if subscription_selected:
+        # The executor copies the user's config.toml into its private CODEX_HOME;
+        # pinning the built-in provider prevents a custom default from hijacking
+        # the subscription route. OPENAI_API_KEY is stripped by the executor.
+        env["HARNESS_CODEX_MODEL_PROVIDER"] = "openai"
+    elif provider is not None:
         configure_agent_harness_with_provider(env, provider, harness_type="codex")
     elif codex_config_provider_dismissed(load_config()):
         # No credential resolved. If the user Removed codex's custom
@@ -2091,6 +2136,79 @@ def _build_hermes_spawn_env(
     if os_env_payload is not None:
         env["HARNESS_HERMES_OS_ENV"] = os_env_payload
     _apply_harness_path_override(env, "hermes")
+    return env
+
+
+def _build_gemini_cli_spawn_env(
+    spec: AgentSpec,
+    *,
+    cwd: Path | None = None,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """Reject the quarantined Google consumer-OAuth subscription transport."""
+
+    del spec, cwd, workdir
+    raise OmnigentError(
+        "Gemini CLI consumer OAuth is not available for subscription routing.",
+        code=ErrorCode.INVALID_INPUT,
+    )
+
+
+def _build_cursor_wsl_spawn_env(
+    spec: AgentSpec,
+    *,
+    cwd: Path | None = None,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """Build the explicit, subscription-backed Cursor WSL environment.
+
+    Cursor authentication remains inside the selected WSL distro. The distro
+    and Windows workspace are mandatory so launch cannot guess either value.
+    """
+    del workdir
+    from omnigent.cursor_wsl import (
+        CursorWslError,
+        validate_distro_name,
+        validate_linux_user,
+        windows_path_to_wsl,
+    )
+    from omnigent.onboarding.subscription_readiness import (
+        resolve_cursor_distro,
+        resolve_cursor_user,
+    )
+
+    distro, _ = resolve_cursor_distro(config=load_config())
+    if distro is None:
+        raise OmnigentError(
+            "Cursor WSL requires an explicit `cursor_wsl.distro` setting.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    user, _ = resolve_cursor_user(config=load_config())
+    if user is None:
+        raise OmnigentError(
+            "Cursor WSL requires an explicit `cursor_wsl.user` setting.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if cwd is None:
+        raise OmnigentError(
+            "Cursor WSL requires a Windows session working directory.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    try:
+        distro = validate_distro_name(distro.strip())
+        user = validate_linux_user(user.strip())
+        windows_path_to_wsl(str(cwd))
+    except CursorWslError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    env = {
+        _HARNESS_SUBSCRIPTION_AUTH_ENV: subscription_marker("cursor-wsl"),
+        "HARNESS_CURSOR_WSL_DISTRO": distro,
+        "HARNESS_CURSOR_WSL_USER": user,
+        "HARNESS_CURSOR_WSL_CWD": str(cwd),
+    }
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        env["HARNESS_CURSOR_WSL_MODEL"] = model
     return env
 
 

@@ -390,6 +390,61 @@ async def test_a_failed_chip_persist_still_routes() -> None:
     assert decision.action == "route"
 
 
+async def test_required_route_denies_when_the_pin_cannot_be_stored() -> None:
+    """Fail-closed routing never lets an unpinned selection reach the CLI."""
+    rec = _Recorder(pin_ok=False)
+
+    async def _route(harness: str | None, prompt: str) -> tuple[str | None, dict[str, Any]]:
+        del harness, prompt
+        return ROUTED_MODEL, {
+            "rationale": "subscription judge pick",
+            "model": ROUTED_MODEL,
+            "routing_required": True,
+        }
+
+    decision = await resolve_turn_route(
+        "conv_1",
+        _request(),
+        conv=_FakeConv(),
+        route_turn=_route,
+        pin=rec.pin,
+        persist=rec.persist,
+    )
+
+    assert decision.action == "deny"
+    assert decision.terminal is True
+    assert rec.chips == []
+
+
+async def test_required_route_denies_when_the_receipt_cannot_be_stored() -> None:
+    """A durable routing receipt is a precondition for required dispatch."""
+
+    async def _route(harness: str | None, prompt: str) -> tuple[str | None, dict[str, Any]]:
+        del harness, prompt
+        return ROUTED_MODEL, {
+            "rationale": "subscription judge pick",
+            "model": ROUTED_MODEL,
+            "routing_required": True,
+        }
+
+    async def _boom(model: str, verdict: dict[str, Any]) -> None:
+        del model, verdict
+        raise RuntimeError("store down")
+
+    rec = _Recorder()
+    decision = await resolve_turn_route(
+        "conv_1",
+        _request(),
+        conv=_FakeConv(),
+        route_turn=_route,
+        pin=rec.pin,
+        persist=_boom,
+    )
+
+    assert decision.action == "deny"
+    assert decision.terminal is True
+
+
 # ── Wire types ──────────────────────────────────────────────────────
 
 

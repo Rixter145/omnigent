@@ -1,15 +1,12 @@
 spec_version: 1
 name: codex
-description: Codex coding sub-agent — implements, cross-vendor reviews, or explores a scoped task in its own worktree.
+description: Windows-safe ChatGPT/Codex subscription coding sub-agent — implements, cross-vendor reviews, or explores a scoped task in its own worktree.
 
 executor:
   type: omnigent
   config:
-    harness: codex-native
-    # YOLO: headless workers can't answer approval prompts, so run Codex
-    # with full bypass. The server translates this into
-    # ``--dangerously-bypass-approvals-and-sandbox`` (native sub-agents only).
-    yolo: true
+    # App-server/SDK harness: uses the official Codex CLI login without tmux.
+    harness: codex
 
 prompt: |
   You are Codex, a coding sub-agent dispatched by the polly

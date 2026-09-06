@@ -393,6 +393,7 @@ class SubagentRouteDecision:
     raw_model: str | None = None
     decision_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     router_source: str | None = None
+    receipt: dict[str, Any] | None = None
 
     def to_payload(self) -> dict[str, Any]:
         """Serialize to the frozen response shape.
@@ -407,6 +408,7 @@ class SubagentRouteDecision:
             "rationale": self.rationale,
             "decision_id": self.decision_id,
             "router_source": self.router_source,
+            "receipt": self.receipt,
         }
 
     @classmethod
@@ -429,6 +431,7 @@ class SubagentRouteDecision:
             raw_model=_opt_str(payload.get("raw_model")),
             decision_id=decision_id if isinstance(decision_id, str) else str(uuid.uuid4()),
             router_source=_opt_str(payload.get("router_source")),
+            receipt=payload.get("receipt") if isinstance(payload.get("receipt"), dict) else None,
         )
 
 
@@ -462,6 +465,7 @@ def decision_record(
         scope=_SCOPE,
         attempted_override=attempted,
         router_source=decision.router_source,
+        receipt=decision.receipt,
     )
 
 
@@ -529,12 +533,13 @@ def model_in_family(family: str | None, model: str) -> bool:
     :param model: Model id, e.g. ``"databricks-gpt-5-5"``.
     :returns: ``True`` when the pairing is servable.
     """
-    if family is None or family == "pi":
+    if family is None or family in {"pi", "multi"}:
         return True
     from omnigent.model_catalog import model_family_token
 
     token = model_family_token(model)
-    return token == "claude" if family == "claude" else token == "openai"
+    expected = {"claude": "claude", "gpt": "openai", "gemini": "gemini"}.get(family)
+    return expected is not None and token == expected
 
 
 def candidate_models(
@@ -543,6 +548,7 @@ def candidate_models(
     cross_harness: bool = False,
     catalog: Mapping[str, list[str]] | None = None,
     allow_static_fallback: bool = True,
+    subscription_mode: bool | None = None,
 ) -> dict[str, list[str]]:
     """Build the harness → models map offered to the router.
 
@@ -564,24 +570,53 @@ def candidate_models(
         may fill a harness the catalog has no row for. Off the AI Gateway it may
         not: every id in that table is a ``databricks-*`` endpoint the spawn
         could not reach, so the catalog is the only provider-accurate source.
+    :param subscription_mode: Whether to use the policy-eligible subscription
+        harnesses and their provider-default sentinels. ``None`` reads runtime
+        settings.
     :returns: Harness → model ids, cheapest first, empty entries dropped.
     """
     from omnigent.server.smart_routing import (
         apply_servable_alias,
         catalog_models_for_harness,
         infer_models,
+        routing_settings,
+    )
+    from omnigent.subscription_defaults import (
+        SUBSCRIPTION_HARNESSES,
+        subscription_default_model,
     )
 
-    offered = (harness, _COUNTERPART_HARNESS.get(harness)) if cross_harness else (harness,)
+    if subscription_mode is None:
+        subscription_mode = routing_settings().provider == "subscription"
+    offered = (
+        SUBSCRIPTION_HARNESSES
+        if cross_harness and subscription_mode
+        else (harness, _COUNTERPART_HARNESS.get(harness))
+        if cross_harness
+        else (harness,)
+    )
     result: dict[str, list[str]] = {}
     for candidate in offered:
         if candidate is None or candidate in result:
             continue
-        from_catalog = catalog_models_for_harness(
-            catalog, candidate, allow_self=candidate == harness
+        from_catalog = (
+            None
+            if subscription_mode
+            else catalog_models_for_harness(catalog, candidate, allow_self=candidate == harness)
         )
-        static = infer_models(candidate) if allow_static_fallback else None
-        models = from_catalog or static or []
+        static = (
+            None
+            if subscription_mode
+            else infer_models(candidate)
+            if allow_static_fallback
+            else None
+        )
+        subscription_default = subscription_default_model(candidate) if subscription_mode else None
+        models = (
+            [subscription_default]
+            if subscription_default is not None
+            else from_catalog or static or []
+        )
         # A catalog row can hold models the harness cannot speak (a codex
         # ``"self"`` row lists Claude ids too), which earn a hard
         # ``model_family_mismatch`` at dispatch.
@@ -591,7 +626,8 @@ def candidate_models(
         # spawn's model matches what routing resolves to; dedupe when the
         # catalog carries both spellings.
         models = list(dict.fromkeys(apply_servable_alias(m) for m in models))
-        models = _with_unadvertised_arms(models, family)
+        if not subscription_mode:
+            models = _with_unadvertised_arms(models, family)
         if models:
             result[candidate] = models
     return result
@@ -647,8 +683,15 @@ def _routing_task(req: SubagentRouteRequest) -> str:
     return _PLACEHOLDER_TASK
 
 
-def _unavailable_decision(reason: str) -> SubagentRouteDecision:
-    """Allow the spawn unchanged and say why nothing was routed."""
+def _unavailable_decision(reason: str, *, required: bool = False) -> SubagentRouteDecision:
+    """Return legacy allow, or an explicit deny for required routing."""
+    if required:
+        return SubagentRouteDecision(
+            action="deny",
+            rationale=(
+                f"Required subscription routing is unavailable; the spawn was denied. {reason}"
+            ),
+        )
     return SubagentRouteDecision(
         action="allow",
         rationale=f"Routing unavailable ({reason}); spawn allowed unchanged",
@@ -723,6 +766,13 @@ async def resolve_subagent_route(
             await persist(decision_record(req, decision))
         except Exception:
             _logger.exception("route-subagent: decision persist failed for session=%s", session_id)
+            from omnigent.server.smart_routing import routing_required
+
+            if routing_required(caps):
+                return _unavailable_decision(
+                    "the validated decision receipt could not be stored",
+                    required=True,
+                )
     return decision
 
 
@@ -758,10 +808,21 @@ async def _decide(
         route_with_fallback,
         select_router,
     )
+    from omnigent.server.smart_routing import (
+        build_routing_receipt,
+        routing_required,
+        routing_settings,
+    )
+
+    required = routing_required(caps)
 
     backends = backends_from_caps(caps)
     if select_router(backends, gateway_backed=gateway_backed) is None:
-        return _unavailable_decision("no routing client configured")
+        from omnigent.server.smart_routing import routing_required
+
+        return _unavailable_decision(
+            "no routing client configured", required=routing_required(caps)
+        )
 
     candidates = (
         available_models
@@ -771,10 +832,13 @@ async def _decide(
             cross_harness=cross_harness,
             catalog=catalog,
             allow_static_fallback=allow_static_fallback,
+            subscription_mode=routing_settings(caps).provider == "subscription",
         )
     )
     if not candidates:
-        return _unavailable_decision(f"no candidate models for harness {req.harness}")
+        return _unavailable_decision(
+            f"no candidate models for harness {req.harness}", required=required
+        )
 
     # An explicit ``requested_model`` never short-circuits this call: the
     # router's pick is the verdict, and the ask only decides how the rationale
@@ -804,9 +868,19 @@ async def _decide(
         detail = (
             _opt_str(getattr(client, "last_error", None)) or raised or "router returned no verdict"
         )
-        return _unavailable_decision(detail)
-
-    return replace(_decision_from_result(req, result, candidates), router_source=source)
+        return _unavailable_decision(detail, required=required)
+    decision = replace(_decision_from_result(req, result, candidates), router_source=source)
+    return replace(
+        decision,
+        receipt=build_routing_receipt(
+            task_summary=task,
+            candidates=candidates,
+            client=client,
+            result=result,
+            source=source,
+            user_override=req.requested_model,
+        ),
+    )
 
 
 def _requested_match(req: SubagentRouteRequest, model: str | None) -> bool:
@@ -910,12 +984,18 @@ async def persist_subagent_decision(
     session_id: str,
     conversation_store: Any,
     record: RoutingDecisionData,
+    *,
+    require_persisted: bool = False,
 ) -> None:
     """Persist and publish *record* as a ``routing_decision`` item.
 
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store exposing ``append``.
     :param record: Decision payload.
+    :param require_persisted: Raise when no durable item is written. The
+        required subscription path uses this before permitting a spawn.
+    :raises RuntimeError: If the store returns no durable item id while
+        ``require_persisted`` is true.
     """
     from omnigent.entities.conversation import NewConversationItem
     from omnigent.runtime import session_stream
@@ -933,7 +1013,12 @@ async def persist_subagent_decision(
         _logger.exception(
             "route-subagent: routing_decision persist failed for session=%s", session_id
         )
+        if require_persisted:
+            raise
         persisted_id = None
+
+    if require_persisted and persisted_id is None:
+        raise RuntimeError("routing decision store returned no durable item id")
 
     session_stream.publish(
         session_id,
@@ -956,7 +1041,14 @@ def store_persister(
     """
 
     async def _persist(record: RoutingDecisionData) -> None:
-        await persist_subagent_decision(session_id, conversation_store, record)
+        from omnigent.server.smart_routing import routing_required
+
+        await persist_subagent_decision(
+            session_id,
+            conversation_store,
+            record,
+            require_persisted=routing_required(),
+        )
 
     return _persist
 
@@ -1003,7 +1095,12 @@ def write_advertisement(
     fd, tmp_name = tempfile.mkstemp(dir=bridge_dir, prefix=f"{filename}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            os.fchmod(handle.fileno(), 0o600)
+            # mkstemp creates the file before any token bytes are written.
+            # fchmod is POSIX-only; on Windows the file inherits the current
+            # user's temp-directory DACL and Python exposes no descriptor-mode
+            # equivalent.
+            if hasattr(os, "fchmod"):
+                os.fchmod(handle.fileno(), 0o600)
             handle.write(json.dumps(payload))
         os.replace(tmp_name, path)
     except BaseException:

@@ -353,7 +353,25 @@ async function ensureServerAuth(cliCommand, serverUrl) {
  * @returns {Promise<{ ok: boolean, ownedByDesktop: boolean, error?: string }>}
  */
 async function restartHost(cliCommand, serverUrl) {
-  await disconnectHost(cliCommand, serverUrl);
+  const disconnected = await disconnectHost(cliCommand, serverUrl);
+  if (!disconnected.ok) {
+    return {
+      ok: false,
+      ownedByDesktop: false,
+      error: disconnected.error || "host did not stop before restart",
+    };
+  }
+  // An adopted daemon is not ours to kill directly. `host stop` can report
+  // success before that daemon has actually gone away, so never re-adopt it as
+  // a successful restart while its verified connection still exists.
+  const connection = await cli.getHostConnectionFast(serverUrl);
+  if (connection.connected) {
+    return {
+      ok: false,
+      ownedByDesktop: false,
+      error: "host connection is still active after stop; restart was not attempted",
+    };
+  }
   return ensureHostConnected(cliCommand, serverUrl);
 }
 

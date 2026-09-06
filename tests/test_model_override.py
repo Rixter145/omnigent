@@ -91,6 +91,8 @@ def test_validate_model_override_rejects_unsafe_values(value: str) -> None:
         "pi",
         "openai-agents",
         "cursor",
+        "cursor-wsl",
+        "gemini-cli",
         "antigravity",
         "kiro-native",
         "native-kiro",
@@ -177,6 +179,8 @@ class TestModelFamilyMismatch:
             ("agy", "gemini-3.5-flash"),
             ("google-antigravity", "gemini-2.5-flash"),
             ("antigravity", "gemini-2.5-pro"),
+            ("gemini-cli", "gemini-subscription-default"),
+            ("cursor-wsl", "auto-smart"),
             ("kiro-native", "claude-sonnet-4.5"),
             ("native-kiro", "gpt-5.4-mini"),
         ],
@@ -218,6 +222,7 @@ class TestModelFamilyMismatch:
             ("antigravity", "claude-opus-4-8", "Gemini-native"),
             ("agy", "gpt-5.4-mini", "Gemini-native"),
             ("google-antigravity", "databricks-gpt-5-4", "Gemini-native"),
+            ("gemini-cli", "gpt-5.4-mini", "only runs Gemini CLI models"),
         ],
     )
     def test_wrong_or_unknown_family_is_rejected(

@@ -1,14 +1,14 @@
 spec_version: 1
 name: claude_code
-description: Claude Code coding sub-agent — implements, cross-vendor reviews, or explores a scoped task in its own worktree.
+description: Windows-safe Claude subscription coding sub-agent — implements, cross-vendor reviews, or explores a scoped task in its own worktree.
 
 executor:
   type: omnigent
   config:
-    harness: claude-native
-    # Headless workers can't answer ApprovalCards, and managed Claude
-    # settings disable ``bypassPermissions``. ``auto`` auto-approves without
-    # prompting and is allowed under managed settings (-> ``--permission-mode auto``).
+    # SDK/headless harness: uses the official Claude CLI login without tmux.
+    harness: claude-sdk
+    # Headless workers cannot answer terminal ApprovalCards. Smart Auto keeps
+    # the Claude CLI policy active without the native TUI bridge.
     permission_mode: auto
 
 prompt: |

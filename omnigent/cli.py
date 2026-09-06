@@ -179,11 +179,29 @@ def parse_routing_settings(
     router_name = (routing_cfg.get("router_name") or "").strip() or DEFAULT_ROUTER_NAME
     selection_model = (routing_cfg.get("selection_model") or "").strip() or None
     prefixes = _parse_model_prefixes(routing_cfg.get("model_prefix"))
+    raw_order = routing_cfg.get("judge_order", ("codex", "claude"))
+    if isinstance(raw_order, str):
+        raw_order = [raw_order]
+    if not isinstance(raw_order, (list, tuple)):
+        raw_order = ("codex", "claude")
+    judge_order = tuple(
+        item.strip().lower()
+        for item in raw_order
+        if isinstance(item, str) and item.strip().lower() in {"codex", "claude"}
+    )
+    if not judge_order:
+        judge_order = ("codex", "claude")
+    provider = routing_cfg.get("provider")
+    provider = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
     return RoutingSettings(
         router_name=router_name,
         selection_model=selection_model,
         # Only an absent key falls back: ``model_prefix: []`` means bare ids.
         model_prefixes=MODEL_ID_PREFIXES if prefixes is None else tuple(prefixes),
+        provider=provider,
+        judge_order=judge_order,
+        required=bool(routing_cfg.get("required", False)),
+        allowance_hints=routing_cfg.get("allowance_hints"),
         # The arm menu / alias / effort tables a deployment fronting a different
         # catalog overrides; absent keys keep the built-in defaults.
         **parse_routing_tables(routing_cfg),
@@ -405,12 +423,25 @@ def _build_routing_backends(
     from omnigent.server.routing_backend import RoutingBackends
 
     routing_cfg = cfg.get("routing")
-    provider = routing_cfg.get("provider") if isinstance(routing_cfg, dict) else None
+    provider = settings.provider or (
+        routing_cfg.get("provider") if isinstance(routing_cfg, dict) else None
+    )
     if provider == "none":
         return RoutingBackends()
     external: Any = None  # type: ignore[explicit-any]
     if provider == "external":
         external = _build_external_routing_client(routing_cfg, settings, cfg)
+    elif provider == "subscription":
+        from omnigent.server.smart_routing import SubscriptionRoutingPolicyClient
+
+        # Subscription routing is self-contained: it intentionally does not
+        # require or construct a server LLM/API-key block.
+        return RoutingBackends(
+            local=SubscriptionRoutingPolicyClient(
+                judge_order=settings.judge_order,
+                allowance_hints=settings.allowance_hints,
+            )
+        )
     elif not isinstance(routing_cfg, dict):
         external = _build_default_databricks_routing_client(cfg, settings)
     return RoutingBackends(external=external, local=_build_local_llm_routing_client(server_llm))

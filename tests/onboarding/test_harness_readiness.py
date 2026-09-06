@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
 import omnigent.onboarding.harness_install as hi
+import omnigent.onboarding.harness_readiness as readiness
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.harness_availability import HARNESS_VERSION_TOO_LOW
 from omnigent.onboarding.harness_readiness import (
@@ -321,6 +323,7 @@ def test_configured_harness_map_covers_all_spellings(
         "pi-native",
         "native-pi",
         "cursor",
+        "cursor-wsl",
         # Native Cursor (``omni cursor``) — gates on the cursor-agent CLI.
         "cursor-native",
         "native-cursor",
@@ -523,6 +526,189 @@ def test_configured_harness_map_probes_codex_readiness_once(
     assert result["codex"] == "needs-auth"
     assert result["codex-native"] == "needs-auth"
     assert result["native-codex"] == "needs-auth"
+
+
+def test_subscription_routing_overlays_strict_candidate_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The picker must not offer SDK/WSL/OAuth candidates that cannot run."""
+    import omnigent.onboarding.subscription_readiness as subscription
+
+    (tmp_path / "config.yaml").write_text(
+        "routing:\n  provider: subscription\n  required: true\n",
+        encoding="utf-8",
+    )
+    _no_clis_installed(monkeypatch)
+    monkeypatch.setattr(readiness, "IS_WINDOWS", False)
+    monkeypatch.setattr(
+        subscription,
+        "subscription_readiness",
+        lambda provider, **kwargs: SimpleNamespace(
+            installed=True,
+            auth_present=True,
+            auth_verified=True,
+            transport_ready=True,
+        ),
+    )
+
+    result = configured_harness_map()
+
+    assert result["claude-native"] is True
+    assert result["claude-sdk"] is True
+    assert result["native-claude"] is True
+    assert result["codex-native"] is True
+    assert result["native-codex"] is True
+    assert result["claude_sdk"] is True
+    assert result["claude"] is True
+    assert result["cursor-wsl"] is True
+    assert "gemini-cli" not in result
+    assert "gemini" not in result
+    assert result["antigravity-native"] is False
+    assert result["native-agy"] is False
+    # API-key / enterprise SDK compatibility remains an explicit option.
+    assert result["antigravity"] is True
+
+
+def test_subscription_routing_fails_closed_for_native_pty_harnesses_on_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows never advertises native tmux/PTY routes as subscription-ready."""
+    import omnigent.onboarding.subscription_readiness as subscription
+
+    (tmp_path / "config.yaml").write_text(
+        "routing:\n  provider: subscription\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(readiness, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        subscription,
+        "subscription_readiness",
+        lambda *args, **kwargs: SimpleNamespace(
+            installed=True,
+            auth_present=True,
+            auth_verified=True,
+            transport_ready=True,
+        ),
+    )
+
+    result = configured_harness_map()
+
+    for harness in ("claude-native", "native-claude", "codex-native", "native-codex"):
+        assert result[harness] is False
+    assert result["claude-sdk"] is True
+    assert result["claude"] is True
+    assert result["claude_sdk"] is True
+    assert result["codex"] is True
+    assert result["cursor-wsl"] is True
+
+
+def test_subscription_routing_ignores_legacy_claude_and_codex_auth_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selected-login readiness overrides every legacy provider signal."""
+    import omnigent.onboarding.subscription_readiness as subscription
+
+    monkeypatch.setattr(readiness, "IS_WINDOWS", False)
+
+    (tmp_path / "config.yaml").write_text(
+        "routing:\n  provider: subscription\nproviders:\n  legacy-gateway:\n    kind: gateway\n",
+        encoding="utf-8",
+    )
+    calls: list[tuple[str, bool]] = []
+
+    def selected_login(provider: str, **kwargs: object) -> SimpleNamespace:
+        calls.append((provider, kwargs.get("verify") is True))
+        if provider in {"claude", "codex"}:
+            return SimpleNamespace(
+                installed=True,
+                auth_present=False,
+                auth_verified=False,
+                transport_ready=False,
+            )
+        return SimpleNamespace(
+            installed=True,
+            auth_present=True,
+            auth_verified=True,
+            transport_ready=True,
+        )
+
+    monkeypatch.setattr(subscription, "subscription_readiness", selected_login)
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: True
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._claude_managed_gateway_configured", lambda: True
+    )
+    monkeypatch.setattr("omnigent.codex_native._codex_auth_unavailable_reason", lambda: None)
+
+    result = configured_harness_map()
+
+    assert calls == [("claude", True), ("codex", True), ("cursor-wsl", True)]
+    assert result["claude-native"] == "needs-auth"
+    assert result["claude-sdk"] == "needs-auth"
+    assert result["native-claude"] == "needs-auth"
+    assert result["claude_sdk"] == "needs-auth"
+    assert result["claude"] == "needs-auth"
+    assert result["codex"] == "needs-auth"
+    assert result["codex-native"] == "needs-auth"
+    assert result["native-codex"] == "needs-auth"
+
+
+@pytest.mark.parametrize(
+    ("readiness", "expected"),
+    [
+        (SimpleNamespace(installed=False), "binary-missing"),
+        (SimpleNamespace(installed=True, auth_present=False), "needs-auth"),
+        (
+            SimpleNamespace(
+                installed=True,
+                auth_present=True,
+                auth_verified=True,
+                transport_ready=False,
+            ),
+            False,
+        ),
+    ],
+)
+def test_subscription_routing_projects_cursor_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    readiness: SimpleNamespace,
+    expected: object,
+) -> None:
+    """Cursor's WSL transport failure is reflected in the old host frame."""
+    import omnigent.onboarding.subscription_readiness as subscription
+
+    (tmp_path / "config.yaml").write_text(
+        "routing:\n  provider: subscription\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(subscription, "subscription_readiness", lambda *a, **kw: readiness)
+
+    assert configured_harness_map()["cursor-wsl"] == expected
+
+
+def test_legacy_harness_map_does_not_run_subscription_overlay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Normal installs retain the historical fail-open SDK behavior."""
+    import omnigent.onboarding.subscription_readiness as subscription
+
+    _no_clis_installed(monkeypatch)
+    monkeypatch.setattr(
+        subscription,
+        "subscription_readiness",
+        lambda *a, **kw: pytest.fail("subscription overlay should be disabled"),
+    )
+
+    result = configured_harness_map()
+
+    assert result["claude-sdk"] is True
+    assert result["cursor-wsl"] is True
+    assert "gemini-cli" not in result
 
 
 def test_kimi_readiness_keys_off_binary_and_credential(

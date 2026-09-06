@@ -17,25 +17,15 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useCreateHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem";
+import { isHostAbsolutePath, isWindowsDrivePath } from "./workspacePath";
 
-/** True for Windows drive-letter paths such as `C:/Users/me` or `C:\\Users\\me`. */
-export function isWindowsDrivePath(path: string): boolean {
-  return /^[A-Za-z]:[\\/]/.test(path);
-}
+export { isHostAbsolutePath, isWindowsDrivePath } from "./workspacePath";
 
 function sameHostDirectory(a: string, b: string): boolean {
   if (isWindowsDrivePath(a) && isWindowsDrivePath(b)) {
     return a.replace(/\\/g, "/").toLowerCase() === b.replace(/\\/g, "/").toLowerCase();
   }
   return a === b;
-}
-
-/**
- * True when the path is already an absolute host path: POSIX ``/…``
- * or a Windows drive path (``C:\…`` / ``C:/…``).
- */
-export function isHostAbsolutePath(path: string): boolean {
-  return path.startsWith("/") || isWindowsDrivePath(path);
 }
 
 function lastSeparatorIndex(path: string): number {

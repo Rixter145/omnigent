@@ -10,6 +10,7 @@ review is a sub-agent that returns a structured report, not a transcript
 anyone needs to read through.
 
 ## Procedure
+
 1. Get the task's diff — `sys_os_shell("gh pr diff <pr>")` (or
    `git -C .worktrees/<task_id> diff main...HEAD`).
 2. Run the deterministic gates first — tests / lint / typecheck via
@@ -26,9 +27,9 @@ anyone needs to read through.
    `codex` / `opencode` / `cursor` / `hermes` / `agy` / `pi`, and so on). Use a
    task-based title such as `review-auth-refactor`, never the raw vendor name:
    `sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"agy"|"pi", title="review-<task_slug>",
-   args={purpose: "review", input: "<the diff> + <the acceptance contract>.
-   Review ONLY against the contract. Report blocking / non-blocking /
-   suggestions. Do not edit code."})`. Give it the diff as text — do NOT point
+args={purpose: "review", input: "<the diff> + <the acceptance contract>.
+Review ONLY against the contract. Report blocking / non-blocking /
+suggestions. Do not edit code."})`. Give it the diff as text — do NOT point
    it at the implementer's worktree. Fetch the diff and emit the
    `sys_session_send` call in the SAME turn you decide to review — never end a
    turn having only announced "I'll load cross-review and fetch the diff" with
@@ -52,6 +53,7 @@ anyone needs to read through.
    the user with specifics.
 
 ## Notes
+
 - Cross-review requires a reviewer from a DIFFERENT vendor than the implementer,
   so it needs at least two AVAILABLE workers (per polly's roster preflight). If
   only one worker — or only one vendor that can review this implementer's PR —

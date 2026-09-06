@@ -31,6 +31,9 @@ Covered facets (each is a claim from the bug report):
 - ``test_create_directory_accepts_drive_letter_path`` — creating a
   folder under a Windows path must work (bug: the route only accepts
   paths starting with ``/`` or ``~``).
+- ``test_windows_absolute_workspace_enables_start`` — selecting a native
+  backslash workspace must enable the Start button (bug: the composer only
+  accepted POSIX ``/`` paths).
 
 The async-in-a-fresh-thread shape is inherited from
 ``test_start_session.py`` (pytest-asyncio can't start a loop on the main
@@ -467,6 +470,42 @@ async def _drive_up_from_home_child(base_url: str) -> None:
             # … and must NOT show the drive root (the buggy build lists
             # ``C:\`` — Program Files / Users / Windows — here).
             await expect(page.get_by_test_id("workspace-picker-entry-Windows")).to_have_count(0)
+        finally:
+            await context.close()
+            await browser.close()
+
+
+def test_windows_absolute_workspace_enables_start(live_server: str) -> None:
+    """A selected ``C:\\...`` workspace is valid for session creation.
+
+    The Windows picker already returns native backslashes. Before the
+    composer used the shared host-path predicate, that selected directory
+    still failed its POSIX-only validity check and Start stayed disabled.
+    This drives the real picker and real landing form through that seam.
+    """
+    _run_in_fresh_loop(_drive_windows_absolute_workspace_enables_start(live_server))
+
+
+async def _drive_windows_absolute_workspace_enables_start(base_url: str) -> None:
+    async with _windows_host(base_url) as host_id, async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        context = await browser.new_context(**_video_kwargs())
+        page = await context.new_page()
+        try:
+            await _open_picker_at_windows_home(page, base_url, host_id)
+            await page.get_by_test_id("workspace-picker-entry-work").dispatch_event("click")
+            await expect(page.get_by_test_id("workspace-picker-entry-omnigent-app")).to_be_visible(
+                timeout=10_000
+            )
+            # The landing picker applies each navigated directory immediately;
+            # it intentionally has no separate Select button. Escape closes the
+            # popover without changing the chosen ``C:\\...\\work`` path.
+            await page.keyboard.press("Escape")
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
+                "work"
+            )
+            await page.get_by_test_id("new-chat-landing-input").fill("inspect this workspace")
+            await expect(page.get_by_test_id("new-chat-landing-submit")).to_be_enabled()
         finally:
             await context.close()
             await browser.close()

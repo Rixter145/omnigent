@@ -641,6 +641,9 @@ class RoutingDecisionData(BaseModel):
     raw_model: str | None = None
     attempted_override: str | None = None
     router_source: str | None = None
+    # Additive, credential-blind routing audit data. Optional so all historic
+    # rows and older clients continue to parse unchanged.
+    receipt: dict[str, Any] | None = None
 
     @field_validator("model")
     @classmethod

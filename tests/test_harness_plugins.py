@@ -319,3 +319,27 @@ def test_builtin_native_provider_bridge_id_label_keys_match_constants() -> None:
         else:
             # Bare builders and claude (resolved via a runner helper) carry no key.
             assert provider.bridge_id_label_key is None, provider.key
+
+
+def test_subscription_harness_registry_quarantines_gemini_and_keeps_antigravity() -> None:
+    from omnigent.harness_plugins import (
+        harness_aliases,
+        harness_capabilities,
+        harness_labels,
+        harness_modules,
+        valid_harnesses,
+    )
+
+    assert "gemini-cli" not in valid_harnesses()
+    assert "cursor-wsl" in valid_harnesses()
+    assert "gemini" not in harness_aliases()
+    assert "agy" not in harness_aliases() or harness_aliases()["agy"] == "antigravity"
+    assert harness_modules()["cursor-wsl"] == "omnigent.inner.cursor_wsl_harness"
+    assert harness_modules()["agy"] == harness_modules()["antigravity"]
+    assert "gemini-cli" not in harness_modules()
+    assert "gemini" not in harness_modules()
+    assert "gemini-cli" not in harness_labels()
+    assert "gemini-cli" not in harness_capabilities()
+    assert harness_labels()["cursor-wsl"] == "Cursor WSL"
+    assert harness_capabilities()["antigravity-native"].model_family.value == "gemini"
+    assert harness_capabilities()["cursor-wsl"].integration_mode.value == "cli-subprocess"

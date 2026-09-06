@@ -1559,6 +1559,7 @@ class ClaudeSDKExecutor(Executor):
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
         api_key_helper: str | None = None,
+        subscription_isolation: bool = False,
     ) -> None:
         """Create a ClaudeSDKExecutor.
 
@@ -1632,6 +1633,10 @@ class ClaudeSDKExecutor(Executor):
                 Injected into ``_extra_env`` as
                 :data:`_CLAUDE_API_KEY_HELPER_ENV_KEY` so it reaches
                 the SDK's ``settings.apiKeyHelper`` option at turn time.
+            subscription_isolation: Suppress Claude Code's user, project, and
+                local setting sources for a subscription-routed launch. This
+                preserves bundle plugins and subscription OAuth; it does not
+                use Claude's ``--bare`` mode.
         """
         # Fail loud: a ``databricks-*`` model requires the gateway transport.
         if not gateway and model is not None and model.startswith("databricks-"):
@@ -1642,6 +1647,15 @@ class ClaudeSDKExecutor(Executor):
                 f"Databricks provider with `{cli_invocation()} setup`, to route through "
                 "the Databricks Anthropic gateway."
             )
+        if subscription_isolation:
+            from omnigent.onboarding.ambient import claude_managed_subscription_conflicts
+
+            conflicts = claude_managed_subscription_conflicts()
+            if conflicts:
+                raise RuntimeError(
+                    "Claude subscription isolation refused: managed settings configure "
+                    + ", ".join(conflicts)
+                )
         self._cwd = cwd
         self._os_env_spec = os_env
         self._os_env = os_env is not None
@@ -1658,6 +1672,7 @@ class ClaudeSDKExecutor(Executor):
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
+        self._subscription_isolation = subscription_isolation
         # Write the bundle's plugin manifest now (idempotent) so that
         # ``--plugin-dir <bundle>`` produces clean
         # ``<agent-name>:<skill-name>`` labels in Claude's skill
@@ -2595,7 +2610,10 @@ class ClaudeSDKExecutor(Executor):
         # skills into the model's system prompt despite
         # ``skills=[]`` (the live regression that prompted this
         # branch).
-        if resolved.setting_sources is not None:
+        if self._subscription_isolation:
+            # Plugin-based bundle skills remain available independently.
+            options_kwargs["setting_sources"] = []
+        elif resolved.setting_sources is not None:
             options_kwargs["setting_sources"] = resolved.setting_sources
         try:
             reasoning_effort = validate_effort(

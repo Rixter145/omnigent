@@ -89,6 +89,19 @@ def _isolate_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, yaml_text: 
     (tmp_path / "config.yaml").write_text(yaml_text)
 
 
+def test_cursor_subscription_mvp_harness_has_truthful_provider_resolution() -> None:
+    provider = resolve_model_provider(_worker_spec("cursor-wsl"), "cursor-wsl")
+    assert provider.kind == "subscription"
+    assert provider.cli == "cursor-wsl"
+    assert model_family_token("auto-smart") == "other"
+
+
+@pytest.mark.parametrize("harness", ["gemini", "gemini-cli"])
+def test_google_consumer_oauth_harness_has_no_subscription_catalog_route(harness: str) -> None:
+    provider = resolve_model_provider(_worker_spec(harness), harness)
+    assert provider.kind == "none"
+
+
 def _worker_spec(harness: str, **executor_kwargs: object) -> AgentSpec:
     """Build a real worker spec declaring *harness*.
 
@@ -831,7 +844,7 @@ def test_family_filter_per_harness(
         ("system.ai.kimi-k2-instruct", "openai"),
         ("kimi-for-coding", "openai"),
         ("databricks-meta-llama-3.3-70b-instruct", "other"),
-        ("gemini-3.5-flash", "other"),
+        ("gemini-3.5-flash", "gemini"),
         # Segment matching, not substring: an unrelated endpoint name that
         # happens to contain the letters is not the GLM family.
         ("glmqlfit-eval", "other"),
@@ -1730,7 +1743,7 @@ def test_openai_compatible_listing_mints_bearer_via_auth_command(
         "    default: true\n"
         "    openai:\n"
         "      base_url: https://gw.example.com/v1\n"
-        "      auth_command: printf tok-from-cmd\n"
+        "      auth_command: echo tok-from-cmd\n"
         "      wire_api: chat\n",
     )
     seen_auth: list[str | None] = []

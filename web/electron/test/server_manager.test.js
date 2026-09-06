@@ -11,7 +11,7 @@ const { describe, it, mock, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
 
 const cli = require("../src/omnigent_cli");
-const { ensureServerAuth } = require("../src/server_manager");
+const { ensureServerAuth, restartHost } = require("../src/server_manager");
 
 const SERVER = "https://app.example.com";
 const CLI_PATH = "/bin/omnigent";
@@ -116,5 +116,39 @@ describe("ensureServerAuth", () => {
     assert.equal(res.ok, false);
     assert.equal(res.authError, true);
     assert.match(res.error, /omnigent login https:\/\/app\.example\.com/);
+  });
+});
+
+describe("restartHost", () => {
+  afterEach(() => {
+    mock.restoreAll();
+  });
+
+  it("fails closed and does not reconnect when stopping an adopted host fails", async () => {
+    const stop = mock.method(cli, "stopHost", async () => ({
+      ok: false,
+      output: "permission denied",
+    }));
+    const connection = mock.method(cli, "getHostConnectionFast", async () => ({
+      connected: false,
+    }));
+
+    const res = await restartHost(CLI_PATH, SERVER);
+
+    assert.deepEqual(res, { ok: false, ownedByDesktop: false, error: "permission denied" });
+    assert.equal(stop.mock.callCount(), 1);
+    assert.equal(connection.mock.callCount(), 0);
+  });
+
+  it("fails closed when the adopted host remains connected after a successful stop", async () => {
+    mock.method(cli, "stopHost", async () => ({ ok: true, output: "stopping" }));
+    const connection = mock.method(cli, "getHostConnectionFast", async () => ({ connected: true }));
+
+    const res = await restartHost(CLI_PATH, SERVER);
+
+    assert.equal(res.ok, false);
+    assert.equal(res.ownedByDesktop, false);
+    assert.match(res.error, /still active/);
+    assert.equal(connection.mock.callCount(), 1);
   });
 });

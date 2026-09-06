@@ -105,6 +105,7 @@ _ANTIGRAVITY_FAMILY_HARNESSES: frozenset[str] = frozenset(
         "native-antigravity",
     }
 )
+_GEMINI_CLI_HARNESSES: frozenset[str] = frozenset({"gemini-cli", "gemini"})
 # A ``databricks-`` gateway prefix marks an id bound to the Databricks gateway,
 # which antigravity never reaches — a definitive mismatch on its own.
 _DATABRICKS_GATEWAY_PREFIX = "databricks-"
@@ -188,6 +189,12 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
             f"'gpt', 'codex', 'glm', or 'kimi'); got {model!r}. Use the "
             "claude_code worker for Claude models or the pi / openai-agents "
             "worker for any other gateway model."
+        )
+    if canon in _GEMINI_CLI_HARNESSES and "gemini" not in lower:
+        return (
+            f"harness {canon!r} only runs Gemini CLI models (id containing "
+            f"'gemini'); got {model!r}. Use claude-sdk, codex, or cursor-wsl "
+            "for another provider family."
         )
     if canon in _ANTIGRAVITY_FAMILY_HARNESSES and (
         is_claude or is_gpt or lower.startswith(_DATABRICKS_GATEWAY_PREFIX)

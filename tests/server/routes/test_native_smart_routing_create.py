@@ -43,6 +43,7 @@ from omnigent.server.smart_routing import (
     AUTO_NATIVE_ROUTING_HARNESSES,
     RoutePick,
     RoutingResult,
+    RoutingSettings,
     TaskV1RouteOptionSource,
     infer_models,
     route_session_harness,
@@ -127,7 +128,12 @@ async def _native_wrappers(client: httpx.AsyncClient, db_uri: str) -> dict[str, 
     return wrappers
 
 
-def _caps_with(routing_client: FakeRoutingClient | None, *, oss: bool) -> FakeCaps:
+def _caps_with(
+    routing_client: FakeRoutingClient | None,
+    *,
+    oss: bool,
+    required: bool = False,
+) -> FakeCaps:
     """Caps whose external side is *routing_client*, with the judge on iff *oss*.
 
     The gateway checks only decide WHICH router answers, so a deployment with no
@@ -141,6 +147,11 @@ def _caps_with(routing_client: FakeRoutingClient | None, *, oss: bool) -> FakeCa
             external=routing_client,
             local=routing_client if oss else None,
         ),
+        routing_settings=(
+            RoutingSettings(provider="subscription", required=True)
+            if required
+            else RoutingSettings()
+        ),
     )
 
 
@@ -150,6 +161,7 @@ async def _create_smart_routing_session(
     routing_client: FakeRoutingClient | None,
     *,
     oss: bool = False,
+    required: bool = False,
 ) -> httpx.Response:
     """POST the landing screen's Smart Routing create payload.
 
@@ -166,7 +178,10 @@ async def _create_smart_routing_session(
         "cost_control_mode_override": "on",
         "smart_routing_message": ROUTING_MESSAGE,
     }
-    with patch("omnigent.runtime._globals._caps", new=_caps_with(routing_client, oss=oss)):
+    with patch(
+        "omnigent.runtime._globals._caps",
+        new=_caps_with(routing_client, oss=oss, required=required),
+    ):
         return await client.post("/v1/sessions", json=body)
 
 
@@ -176,6 +191,7 @@ async def _create_fixed_harness_session(
     routing_client: FakeRoutingClient | None,
     *,
     oss: bool = False,
+    required: bool = False,
     **extra: Any,  # type: ignore[explicit-any]
 ) -> httpx.Response:
     """POST a Smart Routing create for a session pinned to one harness.
@@ -197,7 +213,10 @@ async def _create_fixed_harness_session(
         "smart_routing_message": ROUTING_MESSAGE,
         **extra,
     }
-    with patch("omnigent.runtime._globals._caps", new=_caps_with(routing_client, oss=oss)):
+    with patch(
+        "omnigent.runtime._globals._caps",
+        new=_caps_with(routing_client, oss=oss, required=required),
+    ):
         return await client.post("/v1/sessions", json=body)
 
 
@@ -267,6 +286,231 @@ async def test_fixed_native_harness_create_routes_the_model(
     # ``harness_override`` field on the snapshot — a native session stores none).
     assert "harness_override" not in snapshot.json()
     assert created.json()["harness"] == snapshot.json()["harness"]
+
+
+@pytest.mark.parametrize("native_mode", ["auto", "fixed"])
+async def test_required_native_create_commit_failure_leaves_no_pin_and_retries(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    native_mode: str,
+) -> None:
+    """Required auto and fixed creates delete failed attempts before retrying."""
+    from omnigent.stores.conversation_store import sqlalchemy_store as store_module
+
+    wrappers = await _native_wrappers(client, db_uri)
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=CLAUDE_MODEL, rationale="required subscription pick")
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    before_ids = {conv.id for conv in store.list_conversations(limit=100).data}
+    real_upsert = store_module._upsert_labels
+    route_calls = 0
+    routing_label_calls = 0
+
+    async def _required_route(
+        _message: str,
+        *,
+        harness_candidates: tuple[str, ...],
+        **_kwargs: Any,
+    ) -> tuple[str, str, dict[str, Any], None]:
+        nonlocal route_calls
+        route_calls += 1
+        return (
+            harness_candidates[0],
+            CLAUDE_MODEL,
+            {
+                "rationale": "required subscription pick",
+                "receipt": {"selection_mode": "deterministic"},
+            },
+            None,
+        )
+
+    def _fail_first_routing_label(
+        session: Any,
+        conversation_id: str,
+        updates: dict[str, str],
+        updated_at: int,
+    ) -> None:
+        nonlocal routing_label_calls
+        if ROUTING_DECISION_LABEL_KEY in updates:
+            routing_label_calls += 1
+            if routing_label_calls == 1:
+                raise OSError("injected in-transaction route-label failure")
+        real_upsert(session, conversation_id, updates, updated_at)
+
+    async def _create() -> httpx.Response:
+        if native_mode == "auto":
+            return await _create_smart_routing_session(
+                client,
+                wrappers,
+                routing_client,
+                required=True,
+            )
+        return await _create_fixed_harness_session(
+            client,
+            wrappers["claude-native"],
+            routing_client,
+            required=True,
+        )
+
+    with (
+        patch.object(store_module, "_upsert_labels", _fail_first_routing_label),
+        patch("omnigent.server.smart_routing.route_session_harness", _required_route),
+    ):
+        failed = await _create()
+        assert failed.status_code == 503, failed.text
+
+        after_failure = store.list_conversations(limit=100).data
+        failed_ids = {conv.id for conv in after_failure} - before_ids
+        assert failed_ids == set()
+
+        retried = await _create()
+
+    assert retried.status_code == 201, retried.text
+    assert retried.json()["model_override"] == CLAUDE_MODEL
+    assert route_calls == 2
+    assert routing_label_calls == 2
+
+    retry_id = retried.json()["id"]
+    created_ids = {conv.id for conv in store.list_conversations(limit=100).data} - before_ids
+    assert created_ids == {retry_id}
+    retry_conv = store.get_conversation(retry_id)
+    assert retry_conv is not None
+    assert retry_conv.model_override == CLAUDE_MODEL
+    decision_id = retry_conv.labels.get(ROUTING_DECISION_LABEL_KEY)
+    assert decision_id is not None
+    decisions = _routing_decision_items(db_uri, retry_id)
+    assert len(decisions) == 1
+    assert decisions[0]["decision_id"] == decision_id
+
+
+@pytest.mark.parametrize("remove_outcome", ["success", "proxy_failure", "host_failure"])
+async def test_required_native_create_worktree_rollback_keeps_durable_ownership_until_confirmed(
+    app: Any,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    remove_outcome: str,
+) -> None:
+    """Required-create cleanup removes the worktree before its row or retains the row.
+
+    A failed required receipt arrives after both the row and a requested worktree
+    exist. A confirmed remove may delete the row; a proxy or host failure must
+    retain it so a later cleanup request still owns the branch.
+    """
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.routes._host_worktree import (
+        CreatedWorktree,
+        WorktreeHostUnavailableError,
+        WorktreeProxyError,
+    )
+    from omnigent.stores.conversation_store import sqlalchemy_store as store_module
+    from omnigent.stores.host_store import HostStore
+
+    source_workspace = "/Users/alice/required-routing-repo"
+    worktree_path = f"{source_workspace}-worktrees/required-routing"
+    branch = "feature/required-routing"
+    HostStore(db_uri).upsert_on_connect(_GATEWAY_HOST_ID, "routing-host", RESERVED_USER_LOCAL)
+    wrappers = await _native_wrappers(client, db_uri)
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=CLAUDE_MODEL, rationale="required subscription pick")
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    before_ids = {conv.id for conv in store.list_conversations(limit=100).data}
+    cleanup_order: list[str] = []
+    real_upsert = store_module._upsert_labels
+    real_delete = SqlAlchemyConversationStore.delete_conversation
+    routing_label_calls = 0
+
+    def _fail_first_routing_label(
+        session: Any,
+        conversation_id: str,
+        updates: dict[str, str],
+        updated_at: int,
+    ) -> None:
+        nonlocal routing_label_calls
+        if ROUTING_DECISION_LABEL_KEY in updates:
+            routing_label_calls += 1
+            if routing_label_calls == 1:
+                raise OSError("injected required receipt failure")
+        real_upsert(session, conversation_id, updates, updated_at)
+
+    async def _created_worktree(**_kwargs: Any) -> CreatedWorktree:
+        return CreatedWorktree(worktree_path=worktree_path, branch=branch)
+
+    async def _validated_workspace(**_kwargs: Any) -> str:
+        return source_workspace
+
+    async def _required_route(*_args: Any, **_kwargs: Any) -> tuple[str, dict[str, Any], None]:
+        return (
+            CLAUDE_MODEL,
+            {
+                "rationale": "required subscription pick",
+                "receipt": {"selection_mode": "deterministic"},
+            },
+            None,
+        )
+
+    async def _remove_worktree(**_kwargs: Any) -> None:
+        cleanup_order.append("worktree")
+        if remove_outcome == "proxy_failure":
+            raise WorktreeProxyError("host rejected worktree removal")
+        if remove_outcome == "host_failure":
+            raise WorktreeHostUnavailableError("host disconnected during worktree removal")
+
+    async def _record_delete(self: SqlAlchemyConversationStore, conversation_id: str) -> bool:
+        cleanup_order.append("row")
+        return await real_delete(self, conversation_id)
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._create_session_worktree",
+        _created_worktree,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._validate_session_workspace",
+        _validated_workspace,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._resolve_fixed_native_model_routing",
+        _required_route,
+    )
+    monkeypatch.setattr(
+        app.state,
+        "host_registry",
+        SimpleNamespace(get=lambda host_id: SimpleNamespace(host_id=host_id)),
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._host_worktree.remove_worktree_on_host",
+        _remove_worktree,
+    )
+    monkeypatch.setattr(SqlAlchemyConversationStore, "delete_conversation", _record_delete)
+
+    with patch.object(store_module, "_upsert_labels", _fail_first_routing_label):
+        failed = await _create_fixed_harness_session(
+            client,
+            wrappers["claude-native"],
+            routing_client,
+            required=True,
+            host_id=_GATEWAY_HOST_ID,
+            workspace=source_workspace,
+            git={"branch_name": branch},
+        )
+
+    assert failed.status_code == 503, failed.text
+    after_ids = {conv.id for conv in store.list_conversations(limit=100).data}
+    created_ids = after_ids - before_ids
+    if remove_outcome == "success":
+        assert cleanup_order == ["worktree", "row"]
+        assert created_ids == set()
+    else:
+        assert cleanup_order == ["worktree"]
+        assert len(created_ids) == 1
+        retained = store.get_conversation(created_ids.pop())
+        assert retained is not None
+        assert retained.workspace == worktree_path
+        assert retained.git_branch == branch
+        assert "durable cleanup ownership" in failed.text
+        assert "could not be confirmed removed" in failed.text
 
 
 # A create that cannot pin the pick still opens the terminal on the CLI's own

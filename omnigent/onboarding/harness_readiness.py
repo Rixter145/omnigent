@@ -26,15 +26,16 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import omnigent.onboarding.gemini_auth as _gemini_auth
 import omnigent.onboarding.kimi_auth as _kimi_auth
-from omnigent._platform import resolve_cli_binary
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
 from omnigent.harness_availability import (
     CODEX_CANONICAL_HARNESSES,
     HARNESS_BINARY_MISSING,
+    HARNESS_NEEDS_AUTH,
     HARNESS_VERSION_TOO_LOW,
     HarnessAvailability,
 )
@@ -570,4 +571,109 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
         if cache_key not in availability_cache:
             availability_cache[cache_key] = _harness_availability(canonical)
         result[spelling] = availability_cache[cache_key]
+    _overlay_subscription_routing_readiness(result)
     return result
+
+
+def _subscription_routing_enabled() -> bool:
+    """Return whether the host opted into subscription-backed routing."""
+    try:
+        routing = load_config().get("routing")
+    except Exception:
+        return False
+    return isinstance(routing, Mapping) and routing.get("provider") == "subscription"
+
+
+def _subscription_availability(readiness: object) -> HarnessAvailability:
+    """Project rich subscription readiness onto the legacy picker states."""
+    if bool(getattr(readiness, "transport_ready", False)) and bool(
+        getattr(readiness, "auth_verified", False)
+    ):
+        return True
+    if not bool(getattr(readiness, "installed", False)):
+        return HARNESS_BINARY_MISSING
+    if not bool(getattr(readiness, "auth_present", False)):
+        return HARNESS_NEEDS_AUTH
+    # Installed credentials are not enough when the transport itself is
+    # unavailable (for example, WSL is awaiting a Windows restart).  The
+    # legacy frame has no transport-specific reason, so fail closed without
+    # pretending another login would repair it.
+    return False
+
+
+def _overlay_subscription_routing_readiness(
+    result: dict[str, HarnessAvailability],
+) -> None:
+    """Make the legacy host map truthful for subscription-routing candidates.
+
+    The established map intentionally treats SDK and unknown harnesses as
+    launchable.  That remains correct outside the opt-in MVP, but the
+    subscription router needs stronger semantics: its Claude SDK path depends
+    on the Claude CLI subscription, Cursor depends on a live WSL transport,
+    and Google consumer OAuth is excluded by policy.
+    """
+    if not _subscription_routing_enabled():
+        return
+
+    try:
+        from omnigent.onboarding.subscription_readiness import subscription_readiness
+
+        claude = subscription_readiness("claude", verify=True)
+    except Exception:
+        _logger.debug("subscription Claude readiness overlay failed", exc_info=True)
+        claude_availability: HarnessAvailability = False
+    else:
+        claude_availability = _subscription_availability(claude)
+
+    for spelling in result:
+        canonical = _canonical_harness(spelling)
+        if canonical in {"claude-native", "native-claude"} and IS_WINDOWS:
+            # Native tmux/PTY sessions cannot start on a Windows host.
+            result[spelling] = False
+        elif canonical in {"claude-native", "native-claude", "claude-sdk"}:
+            result[spelling] = claude_availability
+
+    try:
+        codex = subscription_readiness("codex", verify=True)
+    except Exception:
+        _logger.debug("subscription Codex readiness overlay failed", exc_info=True)
+        codex_availability: HarnessAvailability = False
+    else:
+        codex_availability = _subscription_availability(codex)
+
+    for spelling in result:
+        canonical = _canonical_harness(spelling)
+        if canonical in {"codex-native", "native-codex"} and IS_WINDOWS:
+            # Native tmux/PTY sessions cannot start on a Windows host.
+            result[spelling] = False
+        elif _is_codex_family_harness(canonical):
+            result[spelling] = codex_availability
+
+    try:
+        cursor = subscription_readiness("cursor-wsl", verify=True)
+    except Exception:
+        _logger.debug("subscription Cursor readiness overlay failed", exc_info=True)
+        cursor_availability: HarnessAvailability = False
+    else:
+        cursor_availability = _subscription_availability(cursor)
+    result["cursor-wsl"] = cursor_availability
+
+    # Gemini CLI consumer subscription traffic has migrated to Antigravity,
+    # whose terms prohibit third-party OAuth use.  Keep explicit enterprise /
+    # API-key compatibility outside this opt-in mode, but never advertise a
+    # Google consumer-subscription route here.
+    for spelling in ("gemini-cli", "gemini"):
+        if spelling in result:
+            result[spelling] = False
+
+
+def configured_subscription_provider_map(**kwargs: object) -> dict[str, object]:
+    """Return additive, provenance-bearing subscription readiness.
+
+    The established boolean/structured harness map remains unchanged for old
+    clients.  New setup surfaces can opt into the richer provider state without
+    treating Antigravity as the official Gemini CLI.
+    """
+    from omnigent.onboarding.subscription_readiness import subscription_readiness_map
+
+    return subscription_readiness_map(**kwargs)

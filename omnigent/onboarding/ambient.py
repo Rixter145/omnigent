@@ -492,6 +492,92 @@ def claude_auth_has_credential(creds_path: Path) -> bool:
     return False
 
 
+def _read_claude_managed_settings(
+    paths: tuple[Path, ...] | None = None,
+) -> dict[str, object] | None:
+    """Return Claude Code's first readable object-shaped managed settings file."""
+    for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS if paths is None else paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _managed_value(mapping: dict[str, object], name: str) -> object | None:
+    """Read a managed-setting key without relying on its casing."""
+    folded = name.casefold()
+    return next((value for key, value in mapping.items() if key.casefold() == folded), None)
+
+
+def _managed_env(payload: dict[str, object]) -> dict[str, object]:
+    """Return an object-shaped managed ``env`` block, if present."""
+    value = _managed_value(payload, "env")
+    return value if isinstance(value, dict) else {}
+
+
+def _managed_truthy(value: object | None) -> bool:
+    """Whether a managed boolean-like selector is enabled."""
+    return str(value).strip().casefold() not in ("", "0", "false", "no", "off", "none")
+
+
+def claude_managed_subscription_conflicts(
+    paths: tuple[Path, ...] | None = None,
+) -> tuple[str, ...]:
+    """Name provider/auth contracts that a Claude subscription launch cannot override.
+
+    Claude Code applies administrator-managed settings even when
+    ``setting_sources=[]``. Returned strings are fixed diagnostic classes,
+    never managed values or paths.
+    """
+    payload = _read_claude_managed_settings(paths)
+    if payload is None:
+        return ()
+    env = _managed_env(payload)
+    conflicts: list[str] = []
+
+    if _managed_truthy(_managed_value(payload, "apiKeyHelper")):
+        conflicts.append("managed api-key helper")
+    if _managed_truthy(_managed_value(env, "ANTHROPIC_BASE_URL")):
+        conflicts.append("managed Anthropic base URL")
+    if _managed_truthy(_managed_value(env, "CLAUDE_CODE_USE_GATEWAY")):
+        conflicts.append("managed gateway")
+    if _managed_truthy(_managed_value(env, "CLAUDE_CODE_USE_BEDROCK")) or _managed_truthy(
+        _managed_value(env, "ANTHROPIC_BEDROCK_BASE_URL")
+    ):
+        conflicts.append("managed Bedrock provider")
+    if any(
+        _managed_truthy(_managed_value(env, key))
+        for key in (
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_VERTEX_PROJECT_ID",
+            "CLOUD_ML_REGION",
+            "GOOGLE_CLOUD_PROJECT",
+            "GCLOUD_PROJECT",
+            "GOOGLE_GENAI_USE_VERTEXAI",
+        )
+    ):
+        conflicts.append("managed Vertex provider")
+    if any(
+        _managed_truthy(_managed_value(env, key))
+        for key in (
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY_HELPER",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "CLOUDSDK_AUTH_ACCESS_TOKEN",
+        )
+    ):
+        conflicts.append("managed provider credential")
+    return tuple(conflicts)
+
+
 def claude_managed_gateway(
     paths: tuple[Path, ...] | None = None,
 ) -> tuple[str | None, bool]:
@@ -517,25 +603,15 @@ def claude_managed_gateway(
         credentials api.anthropic.com); ``has_credential`` is whether Claude
         Code has a usable credential to apply at launch.
     """
-    for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS if paths is None else paths:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        raw_env = payload.get("env")
-        env = raw_env if isinstance(raw_env, dict) else {}
-        raw_base_url = env.get("ANTHROPIC_BASE_URL")
-        base_url = raw_base_url.strip() if isinstance(raw_base_url, str) else None
-        has_helper = bool(payload.get("apiKeyHelper"))
-        use_gateway = str(env.get("CLAUDE_CODE_USE_GATEWAY", "")).strip().lower() not in (
-            "",
-            "0",
-            "false",
-        )
-        return base_url or None, has_helper or use_gateway
-    return None, False
+    payload = _read_claude_managed_settings(paths)
+    if payload is None:
+        return None, False
+    env = _managed_env(payload)
+    raw_base_url = _managed_value(env, "ANTHROPIC_BASE_URL")
+    base_url = raw_base_url.strip() if isinstance(raw_base_url, str) else None
+    has_helper = _managed_truthy(_managed_value(payload, "apiKeyHelper"))
+    use_gateway = _managed_truthy(_managed_value(env, "CLAUDE_CODE_USE_GATEWAY"))
+    return base_url or None, has_helper or use_gateway
 
 
 def claude_managed_gateway_display_name(paths: tuple[Path, ...] | None = None) -> str | None:

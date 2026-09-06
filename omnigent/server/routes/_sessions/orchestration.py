@@ -4640,6 +4640,96 @@ def _unavailable_routing_card(reason: str) -> tuple[str, dict[str, Any]]:
     return _UNAVAILABLE_ROUTED_MODEL, {"rationale": reason, "applied": False}
 
 
+def _required_routing_error(exc: Exception) -> OmnigentError:
+    """Turn required routing exhaustion into the server's actionable 503.
+
+    The routing helpers deliberately own legacy fail-open behavior, but an
+    opt-in required route must stop before the persisted message is forwarded.
+    Keeping this translation at the orchestration boundary means all three
+    message shapes (auto parent, child, and fixed-harness) use the same wire
+    error and the normal server exception handler, rather than leaking a raw
+    routing exception as a generic 500.
+
+    :param exc: The bounded required-routing failure from the routing layer.
+    :returns: A structured runner-unavailable application error.
+    """
+    reason = " ".join(str(exc).split())[:1000]
+    return OmnigentError(
+        "Required subscription routing is unavailable; no message was sent. "
+        f"{reason} Repair subscription auth or routing configuration, then retry.",
+        code=ErrorCode.RUNNER_UNAVAILABLE,
+    )
+
+
+def _routing_decision_requires_durability(verdict: Mapping[str, Any] | None) -> bool:
+    """Whether *verdict* belongs to fail-closed subscription routing."""
+    if verdict is not None and verdict.get("routing_required") is True:
+        return True
+    from omnigent.server.smart_routing import routing_required
+
+    return routing_required()
+
+
+def _required_routing_storage_error(operation: str) -> OmnigentError:
+    """Build a bounded fail-closed error for a routing storage operation."""
+    return _required_routing_error(
+        RuntimeError(f"The validated route could not durably {operation}.")
+    )
+
+
+async def _rollback_failed_required_native_create(
+    *,
+    conversation_store: ConversationStore,
+    conversation_id: str,
+    created_worktree_path: str | None,
+    host_id: str | None,
+    git_branch: str | None,
+    delete_worktree_branch: bool,
+    request: Request,
+    routing_error: OmnigentError,
+) -> None:
+    """Remove create-time state when required native routing cannot commit.
+
+    Required routing is fail-closed. Its atomic receipt commit can still fail
+    after the conversation row and a request-created worktree exist. Confirm
+    remote cleanup before deleting the row; otherwise the row remains durable
+    cleanup ownership for the worktree and branch.
+    """
+    if created_worktree_path is not None:
+        try:
+            if host_id is None or git_branch is None:
+                raise OmnigentError(
+                    "Cannot confirm worktree removal because its host or branch was not recorded.",
+                    code=ErrorCode.INTERNAL_ERROR,
+                )
+            await _remove_session_worktree_best_effort(
+                host_id=host_id,
+                worktree_path=created_worktree_path,
+                branch=git_branch,
+                delete_branch=delete_worktree_branch,
+                request=request,
+                reason="required-routing-create-rollback",
+                fail_if_unavailable=True,
+            )
+        except Exception as cleanup_exc:
+            cleanup_detail = " ".join(str(cleanup_exc).split())[:1000]
+            raise OmnigentError(
+                f"{routing_error} The request-created worktree could not be confirmed "
+                f"removed, so failed session {conversation_id} remains as durable cleanup "
+                "ownership. "
+                f"{cleanup_detail or 'Retry session cleanup after repairing the host.'}",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            ) from cleanup_exc
+
+    deleted = await conversation_store.delete_conversation(conversation_id)
+    if not deleted:
+        _logger.warning(
+            "required native create rollback found no conversation for session=%s",
+            conversation_id,
+            extra={"session_id": conversation_id},
+        )
+
+
 def _native_pane_harness(conv: Conversation) -> str | None:
     """The native harness a pane actually runs, past the ``"auto"`` sentinel.
 
@@ -4820,6 +4910,7 @@ async def _forward_event_to_runner(
     file_store: FileStore | None = None,
     artifact_store: ArtifactStore | None = None,
     has_mcp_servers: bool = False,
+    requires_tool_calling: bool = False,
     created_by: str | None = None,
     host_store: HostStore | None = None,
 ) -> str:
@@ -4848,6 +4939,9 @@ async def _forward_event_to_runner(
         ``has_mcp_servers`` hint so ``proxy_stream`` knows to load
         the agent spec and initialise :class:`ProxyMcpManager` for
         this turn. ``False`` by default (agents without MCP servers).
+    :param requires_tool_calling: ``True`` when this agent declares tools the
+        selected brain must be able to call. Used by subscription auto-routing
+        to keep orchestration brains on a tool-capable harness.
     :param created_by: Authenticated identity of the posting actor,
         recorded on the persisted item for attribution.
     :param host_store: Host registrations, read only to learn whether this
@@ -4855,20 +4949,36 @@ async def _forward_event_to_runner(
         ``None`` reads as unknown, which counts as backed.
     :returns: The store-assigned id of the persisted item.
     """
+    import hashlib
     import uuid
 
-    turn_id = f"turn_{uuid.uuid4().hex}"
+    idempotency_key = body.idempotency_key
+    if idempotency_key is not None:
+        turn_id = f"turn_{hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()[:32]}"
+    else:
+        turn_id = f"turn_{uuid.uuid4().hex}"
     item = _build_new_item(body, turn_id, created_by=created_by)
-    persisted_items = await asyncio.to_thread(
-        conversation_store.append,
-        session_id,
-        [item],
-    )
-    await _seed_missing_title_from_user_message(
-        conv,
-        item,
-        conversation_store,
-    )
+    if idempotency_key is not None:
+        existing_item = await asyncio.to_thread(
+            conversation_store.get_idempotent_item,
+            session_id,
+            idempotency_key=idempotency_key,
+        )
+        if existing_item is not None and (
+            existing_item.type != item.type
+            or existing_item.data.model_dump(exclude_none=True)
+            != item.data.model_dump(exclude_none=True)
+            or existing_item.created_by != item.created_by
+        ):
+            raise OmnigentError(
+                "Idempotency key was already used for a different event.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        # An accepted delivery (or one whose response was lost) is already
+        # owned by this key. Never re-forward it: the runner is warm-state
+        # sensitive and a second POST can buffer or execute duplicate work.
+        if existing_item is not None and existing_item.status != "failed":
+            return existing_item.id
     # Don't publish status="running" or input.consumed here —
     # wait until after the forward to the runner succeeds.
     # Publishing early causes the REPL to start its streaming
@@ -4944,11 +5054,6 @@ async def _forward_event_to_runner(
         # registration), so a non-renderer viewer keeps tools advertised
         # — no worse than the pre-hint behavior.
         "browser_renderer_available": session_stream.has_subscribers(session_id),
-        # Id of the item just persisted for this turn. On a cold runner
-        # cache the runner reloads history (which includes this item in
-        # PRE-resolution form) and drops it by id, appending its own
-        # resolved copy — id-based dedup, not a role/content guess.
-        "persisted_item_id": persisted_items[0].id,
     }
     # Persist the turn-initiating actor so /policies/evaluate and MCP
     # tools/call can read it back on any server replica.  Skip system-driven
@@ -4995,6 +5100,9 @@ async def _forward_event_to_runner(
     # before the routing card, matching the message routing path).
     _auto_card_model: str | None = None
     _auto_card_verdict: dict[str, Any] | None = None
+    _auto_decision_id: str | None = None
+    _auto_decision_precommitted = False
+    _auto_pin_model: str | None = None
     # Set when the auto-harness routing call itself failed. The card still
     # says so, but the route-once label is left unclaimed — the same rule the
     # turn, native-pane and child-spawn paths follow, so one outage at create
@@ -5005,6 +5113,7 @@ async def _forward_event_to_runner(
     if conv.harness_override == "auto" and body.type == "message":
         from omnigent.server.smart_routing import (
             _AUTO_ROUTING_HARNESSES,
+            RequiredRoutingUnavailable,
             route_session_harness,
         )
 
@@ -5019,40 +5128,62 @@ async def _forward_event_to_runner(
             )
             # For a forced-auto child, route against the parent's catalog (full
             # spawnable-worker map) rather than the child's leaf "self" catalog.
-            _auto_harness, _auto_model, _auto_verdict, _auto_error = await route_session_harness(
-                _auto_text,
-                session_id=session_id,
-                catalog_session_id=conv.parent_conversation_id,
-                runner_client=runner_client,
-                gateway_backed=_auto_backed,
-                allow_static_fallback=_auto_backed,
-            )
             try:
-                # Always clear the "auto" sentinel even when routing
-                # returned no harness (unavailable/failed) so the branch
-                # doesn't re-run on every subsequent turn.
-                _conv_updates: dict[str, Any] = (
-                    {"harness_override": _auto_harness}
-                    if _auto_harness is not None
-                    else {"_unset_harness_override": True}
+                (
+                    _auto_harness,
+                    _auto_model,
+                    _auto_verdict,
+                    _auto_error,
+                ) = await route_session_harness(
+                    _auto_text,
+                    session_id=session_id,
+                    catalog_session_id=conv.parent_conversation_id,
+                    runner_client=runner_client,
+                    gateway_backed=_auto_backed,
+                    allow_static_fallback=_auto_backed,
+                    requires_tool_calling=requires_tool_calling,
                 )
-                if _auto_model is not None and effective_runner_override is None:
-                    _conv_updates["model_override"] = _auto_model
-                    effective_runner_override = _auto_model
-                _updated = await asyncio.to_thread(
-                    conversation_store.update_conversation,
-                    session_id,
-                    **_conv_updates,
-                )
-                if _updated is not None:
+            except RequiredRoutingUnavailable as exc:
+                raise _required_routing_error(exc) from exc
+            _auto_commit_required = (
+                _auto_model is not None
+                and _auto_verdict is not None
+                and _routing_decision_requires_durability(_auto_verdict)
+            )
+            # An unresolved ``auto`` session chooses a harness and model as one
+            # routing decision. A turn-level model override may belong to a
+            # different harness family, so it cannot supersede that pair: the
+            # persisted receipt, session pins, and forwarded event must agree.
+            if _auto_model is not None:
+                _auto_pin_model = _auto_model
+                effective_runner_override = _auto_model
+            if not _auto_commit_required:
+                try:
+                    # Always clear the "auto" sentinel even when routing
+                    # returned no harness (unavailable/failed) so the branch
+                    # doesn't re-run on every subsequent turn.
+                    _conv_updates: dict[str, Any] = (
+                        {"harness_override": _auto_harness}
+                        if _auto_harness is not None
+                        else {"_unset_harness_override": True}
+                    )
+                    if _auto_pin_model is not None:
+                        _conv_updates["model_override"] = _auto_pin_model
+                    _updated = await asyncio.to_thread(
+                        conversation_store.update_conversation,
+                        session_id,
+                        **_conv_updates,
+                    )
+                    if _updated is None:
+                        raise RuntimeError("conversation disappeared while pinning auto route")
                     conv = _updated
-            except (OSError, ValueError):
-                _logger.warning(
-                    "auto-harness: failed to persist resolved harness for session=%s",
-                    session_id,
-                    exc_info=True,
-                    extra={"session_id": session_id},
-                )
+                except (OSError, ValueError, RuntimeError):
+                    _logger.warning(
+                        "auto-harness: failed to persist resolved harness for session=%s",
+                        session_id,
+                        exc_info=True,
+                        extra={"session_id": session_id},
+                    )
             # Defer card emission until after input.consumed (see below).
             if _auto_model is not None and _auto_verdict is not None:
                 _auto_card_model = _auto_model
@@ -5086,6 +5217,9 @@ async def _forward_event_to_runner(
     _routed_model: str | None = None
     _routed_harness: str | None = None
     _verdict: dict[str, Any] | None = None
+    _decision_id: str | None = None
+    _decision_precommitted = False
+    _turn_spelling: str | None = None
     # Set when the pick has no spelling this session can be switched to, so
     # nothing was pinned and the chip must say so.
     _turn_unapplied = False
@@ -5131,6 +5265,7 @@ async def _forward_event_to_runner(
                 # sys_session_send.
                 from omnigent.server.smart_routing import (
                     AUTO_NATIVE_ROUTING_HARNESSES,
+                    RequiredRoutingUnavailable,
                     route_session_harness,
                 )
 
@@ -5146,6 +5281,15 @@ async def _forward_event_to_runner(
                 _child_harness = _resolve_harness(conv)
                 _child_pinned = _child_harness is not None and _child_harness != "auto"
                 _child_family = harness_family(_child_harness) if _child_pinned else None
+                # The tool-capability gate protects an automatically chosen
+                # orchestration harness. A named, pinned Cursor worker is an
+                # explicit child dispatch: route only its subscription model
+                # default and keep the user's Cursor selection intact.
+                _child_requires_tool_calling = requires_tool_calling and not (
+                    conv.sub_agent_name is not None
+                    and _child_pinned
+                    and _child_harness == "cursor-wsl"
+                )
                 # A single-harness candidate set is the honest offer for a
                 # pinned child: the family filter alone still admits the other
                 # harnesses in that family (a ``codex-native`` child would be
@@ -5166,42 +5310,61 @@ async def _forward_event_to_runner(
                 # spawnable workers (claude_code/codex/pi) with full model
                 # lists, whereas this child's own leaf catalog is "self"-only
                 # and would force the static fallback (a smaller/different set).
-                _routed_harness, _routed_model, _verdict, _route_err = await route_session_harness(
-                    _user_text,
-                    session_id=session_id,
-                    catalog_session_id=conv.parent_conversation_id,
-                    runner_client=runner_client,
-                    allowed_family=_child_family,
-                    harness_candidates=_child_candidates,
-                    gateway_backed=_child_backed,
-                    allow_static_fallback=_child_backed,
-                )
+                try:
+                    (
+                        _routed_harness,
+                        _routed_model,
+                        _verdict,
+                        _route_err,
+                    ) = await route_session_harness(
+                        _user_text,
+                        session_id=session_id,
+                        catalog_session_id=conv.parent_conversation_id,
+                        runner_client=runner_client,
+                        allowed_family=_child_family,
+                        harness_candidates=_child_candidates,
+                        gateway_backed=_child_backed,
+                        allow_static_fallback=_child_backed,
+                        requires_tool_calling=_child_requires_tool_calling,
+                    )
+                except RequiredRoutingUnavailable as exc:
+                    raise _required_routing_error(exc) from exc
                 if _routed_model is not None:
                     effective_runner_override = _routed_model
-                try:
-                    _child_updates: dict[str, Any] = {}
-                    if _routed_model is not None:
-                        _child_updates["model_override"] = _routed_model
-                    if _routed_harness is not None:
-                        _child_updates["harness_override"] = _routed_harness
-                    if _child_updates:
-                        await asyncio.to_thread(
-                            conversation_store.update_conversation,
-                            session_id,
-                            **_child_updates,
-                        )
+                _child_commit_required = (
+                    _routed_model is not None
+                    and _verdict is not None
+                    and _routing_decision_requires_durability(_verdict)
+                )
+                if not _child_commit_required:
+                    try:
+                        _child_updates: dict[str, Any] = {}
                         if _routed_model is not None:
-                            # The child's picker lists catalog ids and its
-                            # harness starts on this pin, so the catalog id
-                            # is the spelling to publish.
-                            _publish_routed_model(session_id, _routed_model)
-                except (OSError, ValueError):
-                    _logger.warning(
-                        "smart_routing: failed to persist harness/model for child session=%s",
-                        session_id,
-                        exc_info=True,
-                        extra={"session_id": session_id},
-                    )
+                            _child_updates["model_override"] = _routed_model
+                        if _routed_harness is not None:
+                            _child_updates["harness_override"] = _routed_harness
+                        if _child_updates:
+                            _updated_child = await asyncio.to_thread(
+                                conversation_store.update_conversation,
+                                session_id,
+                                **_child_updates,
+                            )
+                            if _updated_child is None:
+                                raise RuntimeError(
+                                    "conversation disappeared while pinning child route"
+                                )
+                            if _routed_model is not None:
+                                # The child's picker lists catalog ids and its
+                                # harness starts on this pin, so the catalog id
+                                # is the spelling to publish.
+                                _publish_routed_model(session_id, _routed_model)
+                    except (OSError, ValueError, RuntimeError):
+                        _logger.warning(
+                            "smart_routing: failed to persist harness/model for child session=%s",
+                            session_id,
+                            exc_info=True,
+                            extra={"session_id": session_id},
+                        )
                 if _routed_model is None and _route_err is not None:
                     # ``route_session_harness`` already fails open, so the spawn
                     # runs on whatever the orchestrator asked for — but the
@@ -5213,7 +5376,10 @@ async def _forward_event_to_runner(
                     _route_failed = True
             else:
                 # Top-level sessions: model-only routing (harness already fixed by spec).
-                from omnigent.server.smart_routing import route_turn_or_decline
+                from omnigent.server.smart_routing import (
+                    RequiredRoutingUnavailable,
+                    route_turn_or_decline,
+                )
 
                 _harness = _resolve_harness(conv)
                 # A turn cannot change harness, so only this session's own
@@ -5225,15 +5391,18 @@ async def _forward_event_to_runner(
                 # rather than raising. Raised here it became a 500 on the
                 # events POST, so a router that was merely down cost the user
                 # a message that had already been persisted.
-                _routed_model, _verdict, _turn_route_err = await route_turn_or_decline(
-                    _harness,
-                    _user_text,
-                    session_id=session_id,
-                    runner_client=runner_client,
-                    catalog=await _native_turn_catalog(session_id, conv, runner_client),
-                    gateway_backed=_turn_backed,
-                    allow_static_fallback=_turn_backed,
-                )
+                try:
+                    _routed_model, _verdict, _turn_route_err = await route_turn_or_decline(
+                        _harness,
+                        _user_text,
+                        session_id=session_id,
+                        runner_client=runner_client,
+                        catalog=await _native_turn_catalog(session_id, conv, runner_client),
+                        gateway_backed=_turn_backed,
+                        allow_static_fallback=_turn_backed,
+                    )
+                except RequiredRoutingUnavailable as exc:
+                    raise _required_routing_error(exc) from exc
                 if _turn_route_err is not None:
                     # Not routed, and visibly so — the turn runs on the
                     # session's own model with the reason on its card.
@@ -5247,26 +5416,133 @@ async def _forward_event_to_runner(
                     _turn_spelling = _routed_turn_model_spelling(session_id, conv, _routed_model)
                     if _turn_spelling is None:
                         _turn_unapplied = True
+                        if _routing_decision_requires_durability(_verdict):
+                            raise _required_routing_storage_error(
+                                "apply the selected model to this harness"
+                            )
                     else:
                         effective_runner_override = _routed_model
                         # Persist as the session's model_override so all
                         # subsequent turns use this model automatically.
-                        try:
-                            await asyncio.to_thread(
-                                conversation_store.update_conversation,
-                                session_id,
-                                model_override=_routed_model,
-                            )
-                            _publish_routed_model(session_id, _turn_spelling)
-                        except (OSError, ValueError):
-                            _logger.warning(
-                                "smart_routing: failed to persist model_override "
-                                "for session=%s; turn still uses routed model",
-                                session_id,
-                                exc_info=True,
-                                extra={"session_id": session_id},
-                            )
+                        if not _routing_decision_requires_durability(_verdict):
+                            try:
+                                _updated_turn = await asyncio.to_thread(
+                                    conversation_store.update_conversation,
+                                    session_id,
+                                    model_override=_routed_model,
+                                )
+                                if _updated_turn is None:
+                                    raise RuntimeError(
+                                        "conversation disappeared while pinning routed model"
+                                    )
+                                _publish_routed_model(session_id, _turn_spelling)
+                            except (OSError, ValueError, RuntimeError):
+                                _logger.warning(
+                                    "smart_routing: failed to persist model_override "
+                                    "for session=%s; turn still uses routed model",
+                                    session_id,
+                                    exc_info=True,
+                                    extra={"session_id": session_id},
+                                )
+    # Required routing is a placement guarantee, not an advisory. Persist the
+    # canonical receipt and route-once label before the runner can observe the
+    # selected route. Optional/legacy routing keeps its historical post-forward
+    # card timing and best-effort persistence.
+    _decision_scope = "child_session" if _parent_routing_on else "turn"
+    _overridden: str | None = None
+    if _routed_model is not None and _verdict is not None:
+        if _turn_unapplied:
+            _verdict = _unapplied_routed_verdict(_routed_model, _verdict)
+        from omnigent.server.smart_routing import _bare_id as _bare_model_id
+
+        _overridden = (
+            _attempted_override
+            if _attempted_override is not None
+            and not _route_failed
+            and _bare_model_id(_attempted_override) != _bare_model_id(_routed_model)
+            else None
+        )
+
+    if (
+        _auto_card_model is not None
+        and _auto_card_verdict is not None
+        and not _auto_route_failed
+        and _routing_decision_requires_durability(_auto_card_verdict)
+    ):
+        try:
+            _auto_decision_id = await _emit_server_routing_decision(
+                session_id,
+                conversation_store,
+                _auto_card_model,
+                _auto_card_verdict,
+                scope="session",
+                harness=_auto_harness,
+                require_persisted=True,
+                pin_model_override=_auto_pin_model,
+                pin_harness_override=_auto_harness,
+                unset_harness_override=_auto_harness is None,
+            )
+            _auto_decision_precommitted = True
+        except Exception as exc:
+            raise _required_routing_storage_error("record its decision receipt") from exc
+
+    if (
+        _routed_model is not None
+        and _verdict is not None
+        and not _route_failed
+        and _routing_decision_requires_durability(_verdict)
+    ):
+        try:
+            _decision_id = await _emit_server_routing_decision(
+                session_id,
+                conversation_store,
+                _routed_model,
+                _verdict,
+                scope=_decision_scope,
+                harness=_routed_harness or _resolve_harness(conv),
+                attempted_override=_overridden,
+                require_persisted=True,
+                pin_model_override=_routed_model,
+                pin_harness_override=_routed_harness if _parent_routing_on else None,
+            )
+            if _parent_routing_on:
+                _publish_routed_model(session_id, _routed_model)
+            elif _turn_spelling is not None:
+                _publish_routed_model(session_id, _turn_spelling)
+            _decision_precommitted = True
+        except Exception as exc:
+            raise _required_routing_storage_error("record its decision receipt") from exc
+
     # ────────────────────────────────────────────────────────────────
+    # Required routing's receipt and route-once marker must commit before
+    # accepting the user item.  A receipt failure therefore leaves no input
+    # for a retry to replay or duplicate, while all successful turns retain
+    # the normal persist-before-forward contract.
+    if idempotency_key is None:
+        persisted_items = await asyncio.to_thread(
+            conversation_store.append,
+            session_id,
+            [item],
+        )
+        is_new_delivery = True
+    else:
+        persisted_item, is_new_delivery = await asyncio.to_thread(
+            conversation_store.append_idempotent,
+            session_id,
+            item,
+            idempotency_key=idempotency_key,
+        )
+        persisted_items = [persisted_item]
+        # A concurrent first request may have committed the receipt between
+        # our early read and this append. Its in-progress/accepted input must
+        # remain single-dispatch; only a runner's definitive rejection can be
+        # retried with the same durable item.
+        if not is_new_delivery and persisted_item.status != "failed":
+            return persisted_item.id
+    # On a cold runner cache the runner reloads history (which includes this
+    # item in PRE-resolution form) and drops it by id, appending its own
+    # resolved copy — id-based dedup, not a role/content guess.
+    runner_body["persisted_item_id"] = persisted_items[0].id
     if effective_runner_override is not None:
         runner_body["model_override"] = effective_runner_override
     # Forward the persisted create-time effort on every downward event, like
@@ -5278,7 +5554,7 @@ async def _forward_event_to_runner(
     # per-event value exists; the persisted column is the source.
     # _routed_harness is non-None when the child routing path resolved one
     # this turn (conv is not refreshed, so we use the in-flight value).
-    _effective_harness = _routed_harness or conv.harness_override
+    _effective_harness = _routed_harness or _auto_harness or conv.harness_override
     if _effective_harness is not None and _effective_harness != "auto":
         runner_body["harness_override"] = _effective_harness
 
@@ -5325,14 +5601,45 @@ async def _forward_event_to_runner(
             await _persist_session_status_error_labels(
                 session_id, _reject_error, conversation_store
             )
+            if idempotency_key is not None:
+                await asyncio.to_thread(
+                    conversation_store.set_item_status,
+                    session_id,
+                    persisted_items[0].id,
+                    "failed",
+                )
             _publish_status(session_id, "failed", _reject_error)
             raise OmnigentError(
                 f"Runner rejected the message: {_reject_detail}",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
+        if idempotency_key is not None:
+            await asyncio.to_thread(
+                conversation_store.set_item_status,
+                session_id,
+                persisted_items[0].id,
+                "completed",
+            )
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
         _publish_input_consumed(session_id, persisted_items[0])
+        # A title is presentation metadata, never a dispatch precondition.
+        # Required routing has already committed its receipt and input; an
+        # unavailable title write must not make that accepted turn look safe
+        # to retry.
+        try:
+            await _seed_missing_title_from_user_message(
+                conv,
+                item,
+                conversation_store,
+            )
+        except Exception:  # noqa: BLE001 - presentation metadata must never fail dispatch
+            _logger.warning(
+                "Failed to seed title after dispatch for session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
         _logger.info(
             "turn dispatched to runner for session=%s",
             session_id,
@@ -5343,87 +5650,88 @@ async def _forward_event_to_runner(
                 harness=_effective_harness or "",
             ),
         )
-        # Emit the routing_decision chip AFTER input.consumed so the
-        # live SSE stream delivers the user bubble before the chip —
-        # matching the store order (user message was persisted first).
-        # Auto-harness card (success or failure) emitted here for the same
-        # ordering reason; it was resolved earlier in the turn.
+        # Optional/legacy decisions are emitted after input.consumed so the
+        # live SSE stream delivers the user bubble before the chip. Required
+        # decisions were already stored above as a dispatch precondition.
         if _auto_card_model is not None and _auto_card_verdict is not None:
-            _auto_decision_id = await _emit_server_routing_decision(
-                session_id,
-                conversation_store,
-                _auto_card_model,
-                _auto_card_verdict,
-                scope="session",
-                harness=_auto_harness,
-            )
-            if not _auto_route_failed:
-                # A failed call is NOT this session's routing decision: the
-                # label is the route-once gate, so claiming it would make one
-                # create-time outage the reason nothing routes this session
-                # again. The card still shows what happened.
-                await _stamp_routing_decision_label(
-                    session_id, conversation_store, _auto_decision_id
-                )
-            if conv.parent_conversation_id is not None:
-                await _emit_server_routing_decision(
-                    conv.parent_conversation_id,
-                    conversation_store,
-                    _auto_card_model,
-                    _auto_card_verdict,
-                    agent=agent_name or "",
-                    scope="session",
-                    harness=_auto_harness,
-                    decision_id=_auto_decision_id,
+            try:
+                if not _auto_decision_precommitted:
+                    _auto_decision_id = await _emit_server_routing_decision(
+                        session_id,
+                        conversation_store,
+                        _auto_card_model,
+                        _auto_card_verdict,
+                        scope="session",
+                        harness=_auto_harness,
+                    )
+                if not _auto_route_failed and not _auto_decision_precommitted:
+                    # A failed call is NOT this session's routing decision: the
+                    # label is the route-once gate, so claiming it would make one
+                    # create-time outage the reason nothing routes this session
+                    # again. The card still shows what happened.
+                    await _stamp_routing_decision_label(
+                        session_id, conversation_store, _auto_decision_id
+                    )
+                if conv.parent_conversation_id is not None:
+                    await _emit_server_routing_decision(
+                        conv.parent_conversation_id,
+                        conversation_store,
+                        _auto_card_model,
+                        _auto_card_verdict,
+                        agent=agent_name or "",
+                        scope="session",
+                        harness=_auto_harness,
+                        decision_id=_auto_decision_id,
+                    )
+            except Exception:  # noqa: BLE001 - accepted turns must not become retryable
+                _logger.warning(
+                    "Failed to publish auto routing presentation for session=%s",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
                 )
         if _routed_model is not None and _verdict is not None:
-            _decision_scope = "child_session" if _parent_routing_on else "turn"
-            if _turn_unapplied:
-                _verdict = _unapplied_routed_verdict(_routed_model, _verdict)
-            # The router wins over the orchestrator's own pick; the attempt is
-            # recorded so the UI can show what it overrode. Compared on the bare
-            # arm, so another spelling of the same model (a spawn's
-            # ``system.ai.glm-5-2`` against the router's ``databricks-glm-5-2``)
-            # is not reported as an override.
-            from omnigent.server.smart_routing import _bare_id as _bare_model_id
-
-            _overridden = (
-                _attempted_override
-                if _attempted_override is not None
-                and not _route_failed
-                and _bare_model_id(_attempted_override) != _bare_model_id(_routed_model)
-                else None
-            )
-            _decision_id = await _emit_server_routing_decision(
-                session_id,
-                conversation_store,
-                _routed_model,
-                _verdict,
-                scope=_decision_scope,
-                harness=_routed_harness or _resolve_harness(conv),
-                attempted_override=_overridden,
-            )
-            if not _route_failed:
-                # A failed call is NOT this session's routing decision: the
-                # label is the route-once gate, so stamping it would make one
-                # outage the reason the session never routes again. The card
-                # still shows what happened.
-                await _stamp_routing_decision_label(session_id, conversation_store, _decision_id)
-            # Mirror the routing decision into the parent session so the
-            # orchestrator's transcript also shows which model was chosen
-            # for this sub-agent — the decision is otherwise only visible
-            # on the child session screen.
-            if _parent_routing_on and conv.parent_conversation_id is not None:
-                await _emit_server_routing_decision(
-                    conv.parent_conversation_id,
-                    conversation_store,
-                    _routed_model,
-                    _verdict,
-                    agent=agent_name or "",
-                    scope=_decision_scope,
-                    harness=_routed_harness or _resolve_harness(conv),
-                    decision_id=_decision_id,
-                    attempted_override=_overridden,
+            try:
+                if not _decision_precommitted:
+                    _decision_id = await _emit_server_routing_decision(
+                        session_id,
+                        conversation_store,
+                        _routed_model,
+                        _verdict,
+                        scope=_decision_scope,
+                        harness=_routed_harness or _resolve_harness(conv),
+                        attempted_override=_overridden,
+                    )
+                if not _route_failed and not _decision_precommitted:
+                    # A failed call is NOT this session's routing decision: the
+                    # label is the route-once gate, so stamping it would make one
+                    # outage the reason the session never routes again. The card
+                    # still shows what happened.
+                    await _stamp_routing_decision_label(
+                        session_id, conversation_store, _decision_id
+                    )
+                # Mirror the routing decision into the parent session so the
+                # orchestrator's transcript also shows which model was chosen
+                # for this sub-agent — the decision is otherwise only visible
+                # on the child session screen.
+                if _parent_routing_on and conv.parent_conversation_id is not None:
+                    await _emit_server_routing_decision(
+                        conv.parent_conversation_id,
+                        conversation_store,
+                        _routed_model,
+                        _verdict,
+                        agent=agent_name or "",
+                        scope=_decision_scope,
+                        harness=_routed_harness or _resolve_harness(conv),
+                        decision_id=_decision_id,
+                        attempted_override=_overridden,
+                    )
+            except Exception:  # noqa: BLE001 - parent/card mirrors are best effort
+                _logger.warning(
+                    "Failed to publish routing presentation for session=%s",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
                 )
     except (httpx.HTTPError, ConnectionError) as exc:
         # Transport failure — the runner never answered. The message is already
@@ -5450,6 +5758,8 @@ async def _stamp_routing_decision_label(
     session_id: str,
     conversation_store: ConversationStore,
     decision_id: str | None,
+    *,
+    require_persisted: bool = False,
 ) -> None:
     """Record the decision behind a session's pinned model as a label.
 
@@ -5459,8 +5769,13 @@ async def _stamp_routing_decision_label(
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store exposing ``set_labels``.
     :param decision_id: Decision identity, or ``None`` to skip.
+    :param require_persisted: Raise when the route-once label cannot be
+        stored. Required subscription routing sets this before dispatch.
+    :raises RuntimeError: If a required decision id is absent.
     """
     if decision_id is None:
+        if require_persisted:
+            raise RuntimeError("routing decision has no durable decision id")
         return
     try:
         await asyncio.to_thread(
@@ -5468,13 +5783,15 @@ async def _stamp_routing_decision_label(
             session_id,
             {ROUTING_DECISION_LABEL_KEY: decision_id},
         )
-    except (OSError, ValueError):
+    except Exception:
         _logger.warning(
             "smart_routing: failed to label routing decision for session=%s",
             session_id,
             exc_info=True,
             extra={"session_id": session_id},
         )
+        if require_persisted:
+            raise
 
 
 async def _record_create_route_prompt(
@@ -5597,6 +5914,7 @@ async def _dispatch_session_event_to_runner_impl(
     file_store: FileStore | None,
     artifact_store: ArtifactStore | None,
     has_mcp_servers: bool = False,
+    requires_tool_calling: bool = False,
     created_by: str | None = None,
     runner_router: RunnerRouter | None = None,
     native_terminal_ready: bool = False,
@@ -5654,6 +5972,8 @@ async def _dispatch_session_event_to_runner_impl(
     :param has_mcp_servers: ``True`` when the agent spec declares at
         least one MCP server. Forwarded to the runner as the
         ``has_mcp_servers`` hint. ``False`` by default.
+    :param requires_tool_calling: ``True`` when the resolved agent spec has a
+        declared Omnigent tool surface that its selected harness must support.
     :param created_by: Authenticated identity of the posting actor,
         e.g. ``"alice@example.com"``. On the non-native path it is
         recorded directly on the persisted item. On the claude-native
@@ -5752,10 +6072,15 @@ async def _dispatch_session_event_to_runner_impl(
         # pane cannot take must not become ``model_override``, which would
         # disable routing for every later turn and misattribute usage.
         _native_applied_model: str | None = None
+        _native_decision_id: str | None = None
+        _native_decision_precommitted = False
         if _native_routing_enabled and (
             conv.model_override is None or conv.parent_conversation_id is not None
         ):
-            from omnigent.server.smart_routing import route_turn_or_decline
+            from omnigent.server.smart_routing import (
+                RequiredRoutingUnavailable,
+                route_turn_or_decline,
+            )
 
             _harness = _native_pane_harness(conv)
             _user_text = _extract_user_text_for_routing(body)
@@ -5782,19 +6107,26 @@ async def _dispatch_session_event_to_runner_impl(
                 )
                 # ``_or_decline``: a routing outage must not 500 the message
                 # POST. The pane keeps its own model and the card says why.
-                (
-                    _native_routed_model,
-                    _native_verdict,
-                    _native_route_err,
-                ) = await route_turn_or_decline(
-                    _harness,
-                    _user_text,
-                    session_id=session_id,
-                    runner_client=_native_runner_client,
-                    catalog=await _native_turn_catalog(session_id, conv, _native_runner_client),
-                    gateway_backed=_native_backed,
-                    allow_static_fallback=_native_backed,
-                )
+                try:
+                    (
+                        _native_routed_model,
+                        _native_verdict,
+                        _native_route_err,
+                    ) = await route_turn_or_decline(
+                        _harness,
+                        _user_text,
+                        session_id=session_id,
+                        runner_client=_native_runner_client,
+                        catalog=await _native_turn_catalog(
+                            session_id, conv, _native_runner_client
+                        ),
+                        gateway_backed=_native_backed,
+                        allow_static_fallback=_native_backed,
+                    )
+                except RequiredRoutingUnavailable as exc:
+                    if pending_id is not None:
+                        pending_inputs.resolve(session_id, pending_id)
+                    raise _required_routing_error(exc) from exc
                 if _native_route_err is not None:
                     _native_routed_model, _native_verdict = _unavailable_routing_card(
                         _native_route_err
@@ -5813,21 +6145,60 @@ async def _dispatch_session_event_to_runner_impl(
                         if _native_scope == "turn" or _native_pane_routed_before
                         else _native_routed_model
                     )
+                    if _native_applied_model is None and _routing_decision_requires_durability(
+                        _native_verdict
+                    ):
+                        if pending_id is not None:
+                            pending_inputs.resolve(session_id, pending_id)
+                        raise _required_routing_storage_error(
+                            "apply the selected model to this native harness"
+                        )
                 if _native_applied_model is not None:
-                    try:
-                        await asyncio.to_thread(
-                            conversation_store.update_conversation,
-                            session_id,
-                            model_override=_native_routed_model,
-                        )
-                        _publish_routed_model(session_id, _native_applied_model)
-                    except (OSError, ValueError):
-                        _logger.warning(
-                            "smart_routing: persist failed for native session=%s",
-                            session_id,
-                            exc_info=True,
-                            extra={"session_id": session_id},
-                        )
+                    if not _routing_decision_requires_durability(_native_verdict):
+                        try:
+                            _updated_native = await asyncio.to_thread(
+                                conversation_store.update_conversation,
+                                session_id,
+                                model_override=_native_routed_model,
+                            )
+                            if _updated_native is None:
+                                raise RuntimeError(
+                                    "conversation disappeared while pinning native route"
+                                )
+                            _publish_routed_model(session_id, _native_applied_model)
+                        except (OSError, ValueError, RuntimeError):
+                            _logger.warning(
+                                "smart_routing: persist failed for native session=%s",
+                                session_id,
+                                exc_info=True,
+                                extra={"session_id": session_id},
+                            )
+        if (
+            _native_routed_model is not None
+            and _native_verdict is not None
+            and not _native_route_failed
+            and _routing_decision_requires_durability(_native_verdict)
+        ):
+            try:
+                _native_decision_id = await _emit_server_routing_decision(
+                    session_id,
+                    conversation_store,
+                    _native_routed_model,
+                    _native_verdict,
+                    scope=_native_scope,
+                    harness=_resolve_harness(conv),
+                    require_persisted=True,
+                    pin_model_override=(
+                        _native_routed_model if _native_applied_model is not None else None
+                    ),
+                )
+                if _native_applied_model is not None:
+                    _publish_routed_model(session_id, _native_applied_model)
+                _native_decision_precommitted = True
+            except Exception as exc:
+                if pending_id is not None:
+                    pending_inputs.resolve(session_id, pending_id)
+                raise _required_routing_storage_error("record its decision receipt") from exc
         # ────────────────────────────────────────────────────────────
         # Forward the message, carrying any routed model in-band. The
         # executor applies ``/model`` and injects the message as ONE step
@@ -5861,15 +6232,16 @@ async def _dispatch_session_event_to_runner_impl(
         if _native_routed_model is not None and _native_verdict is not None:
             if _native_applied_model is None and not _native_route_failed:
                 _native_verdict = _unapplied_routed_verdict(_native_routed_model, _native_verdict)
-            _native_decision_id = await _emit_server_routing_decision(
-                session_id,
-                conversation_store,
-                _native_routed_model,
-                _native_verdict,
-                scope=_native_scope,
-                harness=_resolve_harness(conv),
-            )
-            if not _native_route_failed:
+            if not _native_decision_precommitted:
+                _native_decision_id = await _emit_server_routing_decision(
+                    session_id,
+                    conversation_store,
+                    _native_routed_model,
+                    _native_verdict,
+                    scope=_native_scope,
+                    harness=_resolve_harness(conv),
+                )
+            if not _native_route_failed and not _native_decision_precommitted:
                 # The label is the route-once gate, so a failed call must not
                 # claim it — one outage would otherwise stop this pane's
                 # in-harness hook from ever routing.
@@ -5898,6 +6270,7 @@ async def _dispatch_session_event_to_runner_impl(
         file_store=file_store,
         artifact_store=artifact_store,
         has_mcp_servers=has_mcp_servers,
+        requires_tool_calling=requires_tool_calling,
         created_by=created_by,
         host_store=host_store,
     )
@@ -6501,25 +6874,34 @@ async def _relay_runner_stream_once(
                     # raw, id-less runner event is not also forwarded below.
                     routing_item = _routing_decision_item_from_sse(event)
                     if routing_item is not None:
-                        # Persist failure must NOT suppress the live chip
-                        # (the owner's hard requirement: the pick shows the
-                        # moment the turn starts). On a store error, log and
-                        # still publish the live event — id-less, so a later
-                        # snapshot can't dedup it, but a missing reload chip
-                        # beats no chip at all.
+                        # Legacy/advisory routing keeps a live chip when the
+                        # transcript store is unavailable. Required subscription
+                        # routing cannot: continuing would apply a route with no
+                        # durable receipt, so terminate this relay before any
+                        # assistant output is accepted.
+                        from omnigent.server.smart_routing import routing_required
+
+                        _receipt_required = routing_required()
                         try:
                             persisted = await asyncio.to_thread(
                                 conversation_store.append, session_id, [routing_item]
                             )
                             _persisted_id: str | None = persisted[0].id if persisted else None
-                        except Exception:  # noqa: BLE001
+                        except Exception as exc:
                             _logger.exception(
-                                "Relay: routing_decision persist failed for session=%s; "
-                                "publishing the live chip without a durable id",
+                                "Relay: routing_decision persist failed for session=%s",
                                 session_id,
                                 extra={"session_id": session_id},
                             )
+                            if _receipt_required:
+                                raise RuntimeError(
+                                    "required routing decision receipt could not be persisted"
+                                ) from exc
                             _persisted_id = None
+                        if _receipt_required and _persisted_id is None:
+                            raise RuntimeError(
+                                "required routing decision store returned no durable item id"
+                            )
                         session_stream.publish(
                             session_id,
                             {
@@ -7875,10 +8257,11 @@ def _spawn_pins_its_harness(
 
     Two pins count, and both come from outside the router: an explicit
     ``harness_override`` on the spawn, and a declared sub-agent whose spec
-    carries its own harness (polly's ``pi`` / ``claude_code`` workers). Either
-    way the child's CLI is decided before any message is routed, so handing the
-    router the whole multi-harness catalog can only produce a verdict the pane
-    will not honor.
+    carries its own harness (polly's ``pi`` / ``claude_code`` workers). A
+    declared worker may opt its own harness into Smart Routing with
+    ``smart_routing_harness: auto``; that is intentionally not a pin, so an
+    auto parent gives the child the unresolved sentinel and the child's first
+    message independently selects and then pins its provider.
 
     :param body: The validated create request.
     :param agent: The parent agent row whose bundle holds the sub-agent specs.
@@ -7897,7 +8280,11 @@ def _spawn_pins_its_harness(
         sub_agent_name=body.sub_agent_name,
         agent_cache=agent_cache,
     )
-    return sub_spec is not None and spec_harness(sub_spec) is not None
+    if sub_spec is None:
+        return False
+    if _validated_spec_smart_routing_harness(sub_spec) is not None:
+        return False
+    return spec_harness(sub_spec) is not None
 
 
 async def _resolve_fixed_native_model_routing(
@@ -8256,6 +8643,25 @@ async def _create_session_from_existing_agent(
         reasoning_effort=body.reasoning_effort,
     )
 
+    # Required create-time routing must not expose the routed model before its
+    # receipt and route-once marker are durable. Defer that one override to the
+    # store's atomic routing commit below; all unrelated create overrides may
+    # still use the normal update path. Without this boundary, a failed receipt
+    # could leave a model pin that made a retry look already routed.
+    _native_create_required = bool(
+        _native_smart_routing
+        and _native_routed_model is not None
+        and _native_routing_verdict is not None
+        and _routing_decision_requires_durability(_native_routing_verdict)
+    )
+    _fixed_create_required = bool(
+        _fixed_native_harness is not None
+        and _fixed_routed_model is not None
+        and _fixed_routing_verdict is not None
+        and _routing_decision_requires_durability(_fixed_routing_verdict)
+    )
+    _defer_required_model_pin = _native_create_required or _fixed_create_required
+
     # Validated before any row exists so a bad value never creates an
     # orphan session; None (unset) defers to the spec default.
     cost_control_mode_override = _validated_cost_control_mode_override(
@@ -8287,11 +8693,9 @@ async def _create_session_from_existing_agent(
     # Nor is a spawn that NAMED its harness forced: a declared sub-agent
     # (polly's ``pi``) and an explicit ``harness_override`` both pin the CLI the
     # child boots on, which the sentinel does not move — it only re-decides the
-    # row. Forcing them handed the router the whole catalog for a pane already
-    # committed to one harness, so a ``pi`` worker could be stamped with an
-    # applied codex verdict while running pi, and a ``claude-native`` worker
-    # lost its terminal labels (skipped for forced-auto children below). Those
-    # children route in their own family instead.
+    # row. The one deliberate exception is a child spec carrying
+    # ``smart_routing_harness: auto``: that worker asks for this sentinel and
+    # does not boot its placeholder harness before first-message routing.
     _force_auto_for_child = False
     _parent_for_routing: Conversation | None = None
     if body.parent_session_id is not None:
@@ -8613,7 +9017,7 @@ async def _create_session_from_existing_agent(
         updated_conv = await asyncio.to_thread(
             conversation_store.update_conversation,
             conv.id,
-            model_override=model_override,
+            model_override=None if _defer_required_model_pin else model_override,
             reasoning_effort=reasoning_effort,
             cost_control_mode_override=cost_control_mode_override,
             subagent_routing_override=subagent_routing_override,
@@ -8693,14 +9097,54 @@ async def _create_session_from_existing_agent(
         # which native harness + model was chosen (or why it fell back).
         _routed_native = native_coding_agent_for_agent_name(agent.name)
         if _native_routed_model is not None and _native_routing_verdict is not None:
-            await _emit_server_routing_decision(
-                conv.id,
-                conversation_store,
-                _native_routed_model,
-                _native_routing_verdict,
-                scope="session",
-                harness=_routed_native.harness if _routed_native is not None else None,
-            )
+            try:
+                await _emit_server_routing_decision(
+                    conv.id,
+                    conversation_store,
+                    _native_routed_model,
+                    _native_routing_verdict,
+                    scope="session",
+                    harness=_routed_native.harness if _routed_native is not None else None,
+                    require_persisted=_native_create_required,
+                    pin_model_override=(model_override if _native_create_required else None),
+                )
+            except Exception as exc:
+                if _native_create_required:
+                    routing_error = _required_routing_storage_error(
+                        "record its create-time decision receipt"
+                    )
+                    await _rollback_failed_required_native_create(
+                        conversation_store=conversation_store,
+                        conversation_id=conv.id,
+                        created_worktree_path=created_worktree_path,
+                        host_id=body.host_id,
+                        git_branch=git_branch,
+                        delete_worktree_branch=body.git is None or not body.git.existing_branch,
+                        request=request,
+                        routing_error=routing_error,
+                    )
+                    raise routing_error from exc
+                raise
+            if _native_create_required:
+                refreshed_conv = await asyncio.to_thread(
+                    conversation_store.get_conversation, conv.id
+                )
+                if refreshed_conv is None:
+                    routing_error = _required_routing_storage_error(
+                        "reload its atomically committed create-time route"
+                    )
+                    await _rollback_failed_required_native_create(
+                        conversation_store=conversation_store,
+                        conversation_id=conv.id,
+                        created_worktree_path=created_worktree_path,
+                        host_id=body.host_id,
+                        git_branch=git_branch,
+                        delete_worktree_branch=body.git is None or not body.git.existing_branch,
+                        request=request,
+                        routing_error=routing_error,
+                    )
+                    raise routing_error
+                conv = refreshed_conv
             # The same prompt is submitted again inside the harness, where the
             # first-prompt hook would score it a second time for the verdict
             # this session is already pinned to. Fingerprint what was routed so
@@ -8721,16 +9165,63 @@ async def _create_session_from_existing_agent(
         # Same card for a create that routed only the model. The decision label
         # records what pinned the row's model, the way a routed turn does.
         if _fixed_routed_model is not None and _fixed_routing_verdict is not None:
-            _fixed_decision_id = await _emit_server_routing_decision(
-                conv.id,
-                conversation_store,
-                _fixed_routed_model,
-                _fixed_routing_verdict,
-                scope="session",
-                harness=_fixed_native_harness,
-            )
-            await _stamp_routing_decision_label(conv.id, conversation_store, _fixed_decision_id)
-            if _fixed_decision_id is not None:
+            _fixed_required = _fixed_create_required
+            try:
+                _fixed_decision_id = await _emit_server_routing_decision(
+                    conv.id,
+                    conversation_store,
+                    _fixed_routed_model,
+                    _fixed_routing_verdict,
+                    scope="session",
+                    harness=_fixed_native_harness,
+                    require_persisted=_fixed_required,
+                    pin_model_override=(model_override if _fixed_required else None),
+                )
+                if not _fixed_required:
+                    await _stamp_routing_decision_label(
+                        conv.id,
+                        conversation_store,
+                        _fixed_decision_id,
+                        require_persisted=False,
+                    )
+            except Exception as exc:
+                if _fixed_required:
+                    routing_error = _required_routing_storage_error(
+                        "record its create-time decision receipt"
+                    )
+                    await _rollback_failed_required_native_create(
+                        conversation_store=conversation_store,
+                        conversation_id=conv.id,
+                        created_worktree_path=created_worktree_path,
+                        host_id=body.host_id,
+                        git_branch=git_branch,
+                        delete_worktree_branch=body.git is None or not body.git.existing_branch,
+                        request=request,
+                        routing_error=routing_error,
+                    )
+                    raise routing_error from exc
+                raise
+            if _fixed_required:
+                refreshed_conv = await asyncio.to_thread(
+                    conversation_store.get_conversation, conv.id
+                )
+                if refreshed_conv is None:
+                    routing_error = _required_routing_storage_error(
+                        "reload its atomically committed create-time route"
+                    )
+                    await _rollback_failed_required_native_create(
+                        conversation_store=conversation_store,
+                        conversation_id=conv.id,
+                        created_worktree_path=created_worktree_path,
+                        host_id=body.host_id,
+                        git_branch=git_branch,
+                        delete_worktree_branch=body.git is None or not body.git.existing_branch,
+                        request=request,
+                        routing_error=routing_error,
+                    )
+                    raise routing_error
+                conv = refreshed_conv
+            elif _fixed_decision_id is not None:
                 conv.labels[ROUTING_DECISION_LABEL_KEY] = _fixed_decision_id
         elif _fixed_routing_error is not None:
             await _emit_server_routing_decision(

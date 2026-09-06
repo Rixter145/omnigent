@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -205,6 +206,25 @@ def test_candidate_models_offers_both_families_for_auto_sessions() -> None:
     assert set(candidates) == {"claude-native", "codex-native"}
     assert CLAUDE_MODEL in candidates["claude-native"]
     assert GPT_MODEL in candidates["codex-native"]
+
+
+def test_subscription_auto_child_gets_three_policy_eligible_candidates() -> None:
+    candidates = candidate_models(
+        "claude-sdk",
+        cross_harness=True,
+        catalog={"self": [CLAUDE_MODEL, GPT_MODEL]},
+        allow_static_fallback=False,
+        subscription_mode=True,
+    )
+
+    assert candidates == {
+        "claude-sdk": ["claude-subscription-default"],
+        "codex": ["gpt-subscription-default"],
+        "cursor-wsl": ["auto-smart"],
+    }
+    assert model_in_family("gemini", "gemini-subscription-default") is True
+    assert model_in_family("gemini", "gpt-subscription-default") is False
+    assert model_in_family("multi", "auto-smart") is True
 
 
 class _Conv:
@@ -524,6 +544,35 @@ async def test_cross_family_pick_redirects_to_counterpart_harness() -> None:
     assert decision.action == "redirect"
     assert decision.model == GPT_MODEL
     assert decision.harness == "codex-native"
+
+
+async def test_subscription_child_cannot_redirect_to_google_consumer_oauth() -> None:
+    client = FakeRoutingClient(
+        RoutingResult(
+            model="gemini-subscription-default",
+            rationale="independent review",
+            harness="gemini-cli",
+        )
+    )
+    candidates = candidate_models(
+        "claude-sdk",
+        cross_harness=True,
+        allow_static_fallback=False,
+        subscription_mode=True,
+    )
+
+    decision = await resolve_subagent_route(
+        "conv_subscription",
+        _request(harness="claude-sdk", parent_model="claude-subscription-default"),
+        caps=FakeCaps(routing_client=client),
+        available_models=candidates,
+        cross_harness=True,
+        gateway_backed=False,
+        allow_static_fallback=False,
+    )
+
+    assert "gemini-cli" not in candidates
+    assert decision.action == "deny"
 
 
 async def test_in_family_session_only_offers_its_own_harness() -> None:
@@ -874,6 +923,57 @@ async def test_persist_failure_does_not_break_the_decision() -> None:
     assert decision.action == "rewrite"
 
 
+async def test_required_persist_failure_denies_the_spawn() -> None:
+    """Required routing cannot apply a spawn decision with no durable receipt."""
+    client = FakeRoutingClient(
+        RoutingResult(model=CLAUDE_MODEL, rationale="deep reasoning", harness="claude-native")
+    )
+
+    async def _persist(record: RoutingDecisionData) -> None:
+        del record
+        raise RuntimeError("store down")
+
+    decision = await resolve_subagent_route(
+        "conv_1",
+        _request(),
+        caps=FakeCaps(
+            routing_client=client,
+            routing_settings=RoutingSettings(provider="subscription", required=True),
+        ),
+        available_models={"claude-native": [CLAUDE_MODEL]},
+        persist=_persist,
+    )
+
+    assert decision.action == "deny"
+    assert "could not be stored" in decision.rationale
+
+
+async def test_required_store_persister_propagates_append_failure() -> None:
+    """The storage adapter exposes failure to the fail-closed policy layer."""
+
+    class _BoomStore:
+        def append(self, session_id: str, items: list[Any]) -> list[_PersistedItem]:
+            del session_id, items
+            raise RuntimeError("db down")
+
+    record = RoutingDecisionData(
+        model=CLAUDE_MODEL,
+        applied=True,
+        rationale="deep reasoning",
+        decision_id="dec_required",
+        harness="claude-native",
+        scope="native_subagent",
+    )
+
+    with pytest.raises(RuntimeError, match="db down"):
+        await persist_subagent_decision(
+            "conv_1",
+            _BoomStore(),
+            record,
+            require_persisted=True,
+        )
+
+
 # ── Advertisement + loopback endpoint ───────────────────────────────
 
 
@@ -1199,7 +1299,8 @@ def test_the_recorded_routing_class_survives_until_the_session_ends() -> None:
 def test_router_dir_for_session_is_owner_only(tmp_path: Path) -> None:
     path = router_dir_for_session("conv_router_dir")
     assert path.is_dir()
-    assert path.stat().st_mode & 0o777 == 0o700
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o700
 
 
 def test_ensure_session_router_is_idempotent_and_advertises_everywhere(

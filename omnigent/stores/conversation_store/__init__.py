@@ -142,6 +142,12 @@ def pinned_label_key(user_id: str | None) -> str:
     return f"{PINNED_LABEL_KEY}.{suffix}"
 
 
+def event_idempotency_label_key(idempotency_key: str) -> str:
+    """Return the opaque durable receipt key for a client event request."""
+    digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+    return f"omnigent.event.idempotency.v1.{digest}"
+
+
 # Epoch-SECONDS time a session was archived, written on archive and deleted on
 # unarchive. A label rather than a ``conversations`` column, so ageing out old
 # archived sessions needs no schema migration; readers fall back to
@@ -635,6 +641,68 @@ class ConversationStore(ABC):
             to persist.
         :returns: The persisted :class:`ConversationItem` list
             with store-assigned IDs and timestamps.
+        """
+        ...
+
+    @abstractmethod
+    def append_idempotent(
+        self,
+        conversation_id: str,
+        item: NewConversationItem,
+        *,
+        idempotency_key: str,
+    ) -> tuple[ConversationItem, bool]:
+        """Atomically append or recover the event identified by a client key."""
+        ...
+
+    @abstractmethod
+    def get_idempotent_item(
+        self,
+        conversation_id: str,
+        *,
+        idempotency_key: str,
+    ) -> ConversationItem | None:
+        """Return the durable input receipt for a client event key, if any."""
+        ...
+
+    @abstractmethod
+    def set_item_status(
+        self,
+        conversation_id: str,
+        item_id: str,
+        status: str,
+    ) -> ConversationItem | None:
+        """Persist the dispatch state for a durably accepted input item."""
+        ...
+
+    @abstractmethod
+    def commit_routing_decision(
+        self,
+        conversation_id: str,
+        item: NewConversationItem,
+        *,
+        decision_label_key: str,
+        decision_id: str,
+        model_override: str | None = None,
+        harness_override: str | None = None,
+        unset_harness_override: bool = False,
+    ) -> ConversationItem:
+        """Atomically pin and record one required routing decision.
+
+        The conversation overrides, transcript receipt, and route-once label
+        are one integrity boundary. Implementations must commit all three or
+        leave the conversation unchanged so a failed first turn can retry
+        routing instead of inheriting an orphaned pin.
+
+        :param conversation_id: Conversation receiving the required route.
+        :param item: Validated ``routing_decision`` transcript item.
+        :param decision_label_key: Route-once label key.
+        :param decision_id: Decision identity stored in that label.
+        :param model_override: Selected model to pin, or ``None`` to preserve.
+        :param harness_override: Selected harness to pin, or ``None`` to preserve.
+        :param unset_harness_override: Clear an unresolved harness sentinel.
+        :returns: The durably stored receipt item.
+        :raises ConversationNotFoundError: If the conversation disappeared.
         """
         ...
 

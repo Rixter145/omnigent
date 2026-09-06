@@ -9,19 +9,22 @@ Use ONLY for subtasks that are parallel-safe (no shared files, no ordering
 dependency).
 
 ## Procedure
+
 1. Per task, create an isolated worktree:
    `sys_os_shell("git worktree add .worktrees/<task_id> -b polly/<task_id>")`.
    Record the worktree path + branch in the registry
    (`.polly/registry.json`).
 2. Dispatch one implementation sub-agent per task, scoped to its worktree:
-   `sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"agy", title="<task_slug>",
-   args={purpose: "implement", input: "<task + acceptance contract +
-   worktree path>"})`. Use a short task-based title such as `auth-refactor` or
+   `sys_session_send(agent="subscription_worker"|"claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"agy", title="<task_slug>",
+args={purpose: "implement", input: "<task + acceptance contract +
+worktree path>"})`. Use a short task-based title such as `auth-refactor` or
    `fix-sse-error`, never the raw vendor name. State the scope and that it must
    work only inside `.worktrees/<task_id>`. The worker drives the task to green
    and opens its OWN PR for the branch. Every commit the worker authors must
    end with a blank line followed by the exact co-sign trailer as its final
    line — `Co-authored-by: omnigent <noreply@omnigent.ai>`.
+   Prefer `subscription_worker` unless the human requested a vendor; omit
+   `args.model` for it so each child routes and pins independently.
    For a long-running `claude_code` or `codex` implementation with an explicit
    completion condition, the `input` may instead be one standalone
    `/goal <condition>` command containing that same task, worktree, acceptance
@@ -46,6 +49,7 @@ dependency).
    disposable. Don't remove a worktree that still has open fix-tasks.
 
 ## Notes
+
 - Respect the per-turn dispatch cap (enforced by policy). More tasks than the
   cap → dispatch in waves (let the running batch finish before dispatching more).
 - The human can open any sub-agent in the UI's Subagents panel and read its

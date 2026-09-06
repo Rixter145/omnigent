@@ -35,6 +35,14 @@ const DEFAULT_TIMEOUT_MS = 10000;
 const INSTALL_COMMAND =
   "curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | sh";
 
+/** Windows has a native uv/Python install path; the shell bootstrap is POSIX-only. */
+const WINDOWS_INSTALL_COMMAND = "uv tool install --python 3.12 omnigent";
+
+/** @returns {string} */
+function installCommandForPlatform(platform = process.platform) {
+  return platform === "win32" ? WINDOWS_INSTALL_COMMAND : INSTALL_COMMAND;
+}
+
 /**
  * Strip a trailing slash so URL comparisons survive the difference between
  * what the user typed and what the CLI records in a daemon target.
@@ -275,15 +283,18 @@ const CLI_NAMES = ["omnigent", "omni"];
  *
  * @returns {string[]}
  */
-function candidatePaths() {
-  const home = os.homedir();
+function candidatePaths(platform = process.platform, home = os.homedir()) {
+  if (platform === "win32") {
+    return CLI_NAMES.map((name) => path.win32.join(home, ".local", "bin", `${name}.exe`));
+  }
+  const pathApi = path.posix;
   const dirs = [
-    path.join(home, ".local", "bin"),
-    path.join(home, ".cargo", "bin"),
+    pathApi.join(home, ".local", "bin"),
+    pathApi.join(home, ".cargo", "bin"),
     "/opt/homebrew/bin",
     "/usr/local/bin",
   ];
-  return dirs.flatMap((dir) => CLI_NAMES.map((name) => path.join(dir, name)));
+  return dirs.flatMap((dir) => CLI_NAMES.map((name) => pathApi.join(dir, name)));
 }
 
 /**
@@ -525,6 +536,13 @@ function parseJsonLoose(stdout) {
  * path reports `installed:false` rather than failing later.
  *
  * @param {string | null | undefined} configuredPath
+ * @param {string} [platform]
+ * @param {{
+ *   resolveCliPath?: (configuredPath: string | null | undefined) =>
+ *     { path: string, source: "configured" | "path" | "candidate" } | null,
+ *   runCli?: (command: string, args: string[], opts: { timeoutMs: number }) =>
+ *     Promise<{ code: number, stdout: string, stderr: string }>,
+ * }} [deps]
  * @returns {Promise<{
  *   installed: boolean,
  *   path: string | null,
@@ -533,19 +551,32 @@ function parseJsonLoose(stdout) {
  *   installCommand: string,
  * }>}
  */
-async function getCliStatus(configuredPath) {
-  const resolved = resolveCliPath(configuredPath);
+async function getCliStatus(configuredPath, platform = process.platform, deps = {}) {
+  const resolve = deps.resolveCliPath || resolveCliPath;
+  const run = deps.runCli || runCli;
+  const resolved = resolve(configuredPath);
   if (!resolved) {
     return {
       installed: false,
       path: null,
       version: null,
       source: null,
-      installCommand: INSTALL_COMMAND,
+      installCommand: installCommandForPlatform(platform),
     };
   }
-  const res = await runCli(resolved.path, ["--version"], { timeoutMs: 5000 });
-  const version = res.stdout.trim() || res.stderr.trim() || "";
+  // A Windows console script can fail while its launcher/runtime is cold even
+  // though the resolved executable is usable. Retry only that validation once;
+  // a missing path returns above without delay or a spawned process.
+  const attempts = platform === "win32" ? 2 : 1;
+  let res = { code: 1, stdout: "", stderr: "" };
+  let version = "";
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    // Retry only after the preceding cold-launch validation has failed.
+    // oxlint-disable-next-line no-await-in-loop
+    res = await run(resolved.path, ["--version"], { timeoutMs: 5000 });
+    version = res.stdout.trim() || res.stderr.trim() || "";
+    if (res.code === 0 && /\bomni/i.test(version)) break;
+  }
   // Must exit cleanly AND identify itself as omni — `omnigent --version` prints
   // e.g. "omnigent 0.3.0.dev0 (…)". The exit-code alone isn't enough: an
   // unrelated binary (e.g. /bin/echo) also exits 0 on `--version`, and we must
@@ -556,7 +587,7 @@ async function getCliStatus(configuredPath) {
     path: ok ? resolved.path : null,
     version: ok ? version || null : null,
     source: ok ? resolved.source : null,
-    installCommand: INSTALL_COMMAND,
+    installCommand: installCommandForPlatform(platform),
   };
 }
 
@@ -1175,6 +1206,7 @@ module.exports = {
   cliCommandParts,
   runCli,
   parseJsonLoose,
+  installCommandForPlatform,
   getCliStatus,
   getServerStatus,
   startLocalServer,

@@ -445,7 +445,7 @@
               >Install the Omnigent CLI ↗</a
             >
           </p>
-          <p>Already installed it? Re-detect, or set the path below.</p>
+          <p id="cli-install-guidance">Already installed it? Re-detect, or set the path below.</p>
           <button type="button" id="cli-redetect">Re-detect</button>
         </div>
         <p id="cli-path-label">Path to the Omnigent CLI</p>
@@ -631,6 +631,7 @@
       const cliStatus = document.getElementById("cli-status");
       const cliManaged = document.getElementById("cli-managed");
       const cliInstall = document.getElementById("cli-install");
+      const cliInstallGuidance = document.getElementById("cli-install-guidance");
       const cliRedetect = document.getElementById("cli-redetect");
       const cliPathInput = document.getElementById("cli-path");
       const cliBrowse = document.getElementById("cli-browse");
@@ -640,6 +641,23 @@
       // (MDM-managed internal mode).
       let cliInstalled = false;
       let cliCustomizationDisabled = false;
+
+      function isWindowsPlatform() {
+        // The bundled page runs in Electron. userAgentData is preferred when
+        // available; navigator.platform is the compatible Electron fallback.
+        const platform = navigator.userAgentData?.platform || navigator.platform || "";
+        return /^win/i.test(platform);
+      }
+
+      function updateCliInstallGuidance() {
+        const windows = isWindowsPlatform();
+        cliInstallGuidance.textContent = windows
+          ? "On Windows, install with uv, then re-detect. The usual path is %USERPROFILE%\\.local\\bin\\omnigent.exe (or omni.exe)."
+          : "Already installed it? Re-detect, or set the path below.";
+        cliPathInput.placeholder = windows
+          ? "%USERPROFILE%\\.local\\bin\\omnigent.exe"
+          : "/path/to/omni";
+      }
 
       async function refreshCliStatus() {
         let status;
@@ -675,7 +693,8 @@
             ? `Found: ${status.version}`
             : "Omnigent CLI found."
           : "Omnigent CLI not found.";
-        cliPathInput.placeholder = status.path || "/path/to/omni";
+        updateCliInstallGuidance();
+        cliPathInput.placeholder = status.path || cliPathInput.placeholder;
         // Draw the eye to the (otherwise quiet) gear when the CLI is missing,
         // unless policy disabled the gear entirely.
         cliGear.classList.toggle("attention", !cliCustomizationDisabled && !installed);

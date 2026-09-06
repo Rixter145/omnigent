@@ -38,6 +38,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.runtime.workflow import _find_spec_by_name
 from omnigent.server import presence
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -222,6 +223,32 @@ from omnigent.telemetry.events import SessionStoppedEvent as _TelSessionStoppedE
 from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.tools.client_specified import parse_client_side_tool_specs
+
+
+def _spec_requires_tool_calling(spec: Any) -> bool:
+    """Whether a declared agent surface requires Omnigent function tools.
+
+    Async/session-read helpers exist by default but are not necessarily needed
+    for an ordinary direct chat. Explicit builtins, child dispatch, local/MCP
+    tools, OS access, terminals, timers, or sharing are author intent and form
+    a hard capability requirement for an auto-selected brain harness.
+    """
+
+    tools = getattr(spec, "tools", None)
+    sharing = getattr(spec, "agent_session_sharing", None)
+    sharing_value = getattr(sharing, "value", sharing)
+    return bool(
+        getattr(tools, "agents", None)
+        or getattr(tools, "builtins", None)
+        or getattr(spec, "mcp_servers", None)
+        or getattr(spec, "local_tools", None)
+        or getattr(spec, "spawn", False)
+        or getattr(spec, "os_env", None) is not None
+        or getattr(spec, "terminals", None)
+        or getattr(spec, "timers", False)
+        or sharing_value not in (None, "none")
+    )
+
 
 _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
@@ -1908,6 +1935,7 @@ def register_events_routes(
         # asyncio.to_thread wrapper covers the rare cold-cache path
         # where the bundle is extracted from disk for the first time.
         _has_mcp_servers = False
+        _requires_tool_calling = bool(body.tools)
         if _agent is not None and agent_cache is not None and _agent.bundle_location:
             try:
                 _loaded_agent = await asyncio.to_thread(
@@ -1915,7 +1943,16 @@ def register_events_routes(
                     _agent.id,
                     _agent.bundle_location,
                 )
-                _has_mcp_servers = bool(_loaded_agent.spec.mcp_servers)
+                _effective_spec = _loaded_agent.spec
+                if conv.sub_agent_name:
+                    _effective_spec = (
+                        _find_spec_by_name(_loaded_agent.spec, conv.sub_agent_name)
+                        or _effective_spec
+                    )
+                _has_mcp_servers = bool(_effective_spec.mcp_servers)
+                _requires_tool_calling = _requires_tool_calling or _spec_requires_tool_calling(
+                    _effective_spec
+                )
             except Exception:
                 _logger.warning(
                     "Failed to load agent spec for MCP hint for session=%s",
@@ -1973,6 +2010,7 @@ def register_events_routes(
             file_store=file_store,
             artifact_store=artifact_store,
             has_mcp_servers=_has_mcp_servers,
+            requires_tool_calling=_requires_tool_calling,
             created_by=created_by,
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,

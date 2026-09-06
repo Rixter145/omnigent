@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -30,7 +30,12 @@ _logger = logging.getLogger(__name__)
 
 #: Which router produced a decision. ``"databricks-aigw"`` is the external
 #: ``task_v1`` service; ``"oss-llm"`` is the built-in judge.
-RouterSource = Literal["databricks-aigw", "oss-llm"]
+RouterSource = str
+
+
+def _reported_source(client: Any, fallback: str) -> str:
+    source = getattr(client, "router_source", None)
+    return source if isinstance(source, str) and source.strip() else fallback
 
 
 @dataclass(frozen=True)
@@ -155,9 +160,10 @@ async def route_with_fallback(
     if choice is None:
         return None
     if choice.source != "databricks-aigw" or backends.local is None:
+        result = await choice.client.route(message, available_models)
         return RoutedCall(
-            result=await choice.client.route(message, available_models),
-            source=choice.source,
+            result=result,
+            source=_reported_source(choice.client, choice.source),
             client=choice.client,
         )
     try:
@@ -169,15 +175,20 @@ async def route_with_fallback(
         )
     else:
         if result is not None:
-            return RoutedCall(result=result, source="databricks-aigw", client=choice.client)
+            return RoutedCall(
+                result=result,
+                source=_reported_source(choice.client, "databricks-aigw"),
+                client=choice.client,
+            )
         _logger.info(
             "routing: the external router gave no verdict (%s); "
             "falling back to the built-in judge",
             getattr(choice.client, "last_error", None),
         )
+    result = await backends.local.route(message, available_models)
     return RoutedCall(
-        result=await backends.local.route(message, available_models),
-        source="oss-llm",
+        result=result,
+        source=_reported_source(backends.local, "oss-llm"),
         client=backends.local,
     )
 

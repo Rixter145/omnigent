@@ -235,10 +235,12 @@ def _main_route_turn(argv: list[str]) -> int:
        The runner then replays it as a normal user turn, which runs on the
        routed model.
 
-    Fails open everywhere: an absent advertisement, an unreachable
-    endpoint, an unroutable verdict, a pick this pane's gateway does not
-    serve, or a failed switch all exit ``0`` with no output, and the prompt
-    runs untouched on the current model.
+    Legacy routing failures remain fail-open: an absent advertisement, an
+    unreachable endpoint, an unroutable verdict, a pick this pane's gateway
+    does not serve, or a failed switch all exit ``0`` with no output. A
+    required-routing ``deny`` is the explicit exception: it emits the harness
+    block JSON without writing a replay marker, so auth/config repair can be
+    retried on the next prompt.
 
     :param argv: CLI argv after the ``route-turn`` subcommand, e.g.
         ``["--bridge-dir", "/tmp/x", "--harness", "codex-native"]``.
@@ -312,6 +314,17 @@ def _main_route_turn(argv: list[str]) -> int:
         # Not the endpoint URL: it comes out of the advertisement that also
         # holds the bearer token, and this trace is world-readable stderr.
         trace_turn_routing(bridge_dir, "fail-open", "no verdict from the turn router")
+        return 0
+    if decision.get("action") == "deny":
+        rationale = decision.get("rationale")
+        reason = (
+            rationale.replace("\r", " ").replace("\n", " ").strip()[:1000]
+            if isinstance(rationale, str) and rationale.strip()
+            else "Required routing is unavailable; repair routing configuration and retry."
+        )
+        trace_turn_routing(bridge_dir, "deny", "required routing denied the prompt")
+        sys.stdout.write(json.dumps({"decision": "block", "reason": reason}))
+        sys.stdout.flush()
         return 0
     model = decision.get("model")
     if decision.get("action") != "route" or not isinstance(model, str) or not model:

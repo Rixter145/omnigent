@@ -167,6 +167,10 @@ harnesses (`omnigent run <agent.yaml>` with the claude-sdk / cursor / codex
 harnesses). Agents run under a Windows **Job Object** for process-tree
 containment.
 
+For the opt-in MVP that routes the existing UI and Polly workers through local
+Claude, Codex, and Cursor subscription logins, see
+[Windows subscription routing](docs/windows-subscription-routing.md).
+
 What is **not** available on Windows (use Linux/macOS, or WSL, for these):
 
 - the native `omnigent claude` / `omnigent codex` / `omnigent cursor`

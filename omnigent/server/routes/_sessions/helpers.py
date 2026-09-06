@@ -6768,6 +6768,10 @@ async def _emit_server_routing_decision(
     harness: str | None = None,
     decision_id: str | None = None,
     attempted_override: str | None = None,
+    require_persisted: bool = False,
+    pin_model_override: str | None = None,
+    pin_harness_override: str | None = None,
+    unset_harness_override: bool = False,
 ) -> str | None:
     """Persist and publish a ``routing_decision`` transcript chip.
 
@@ -6786,9 +6790,20 @@ async def _emit_server_routing_decision(
         router overrode — an LLM-supplied ``args.model``, or a native
         spawn's own ``requested_model``. ``None`` when nothing was asked
         for, or when the pick names the same arm as the ask.
+    :param require_persisted: Raise when the decision cannot be stored.
+        Required subscription routing uses this before dispatch so an
+        applied route can never exist only as an ephemeral live event. In
+        this mode the store atomically writes the pin, receipt, and route-once
+        label rather than exposing three independently committed writes.
+    :param pin_model_override: Model pin to include in that atomic commit.
+    :param pin_harness_override: Harness pin to include in that atomic commit.
+    :param unset_harness_override: Clear an unresolved harness sentinel in
+        the atomic commit.
     :returns: The decision id, so callers can join it onto the session
         row, or ``None`` when the payload failed validation and no chip
         was recorded.
+    :raises RuntimeError: If ``require_persisted`` is true and validation
+        or persistence fails.
     """
     import uuid
 
@@ -6810,33 +6825,56 @@ async def _emit_server_routing_decision(
         "router_source": (
             router_source if isinstance(router_source, str) and router_source else None
         ),
+        "receipt": verdict.get("receipt") if isinstance(verdict.get("receipt"), dict) else None,
     }
     if agent is not None:
         item_data["agent"] = agent
     try:
         parsed_data = parse_item_data("routing_decision", item_data)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as exc:
         _logger.warning(
             "Server routing: failed to parse routing_decision data",
             extra={"session_id": session_id},
         )
+        if require_persisted:
+            raise RuntimeError("routing decision payload failed validation") from exc
         return None
 
     routing_item = NewConversationItem(
         type="routing_decision",
-        response_id=f"routing_{uuid.uuid4().hex}",
+        response_id=f"routing_{uuid.uuid5(uuid.NAMESPACE_URL, resolved_decision_id).hex}",
         data=parsed_data,
     )
     try:
-        persisted = await asyncio.to_thread(conversation_store.append, session_id, [routing_item])
-        persisted_id: str | None = persisted[0].id if persisted else None
-    except Exception:  # noqa: BLE001
+        if require_persisted:
+            persisted_item = await asyncio.to_thread(
+                conversation_store.commit_routing_decision,
+                session_id,
+                routing_item,
+                decision_label_key=ROUTING_DECISION_LABEL_KEY,
+                decision_id=resolved_decision_id,
+                model_override=pin_model_override,
+                harness_override=pin_harness_override,
+                unset_harness_override=unset_harness_override,
+            )
+            persisted_id: str | None = persisted_item.id if persisted_item is not None else None
+        else:
+            persisted = await asyncio.to_thread(
+                conversation_store.append, session_id, [routing_item]
+            )
+            persisted_id = persisted[0].id if persisted else None
+    except Exception:
         _logger.exception(
             "Server routing: routing_decision persist failed for session=%s",
             session_id,
             extra={"session_id": session_id},
         )
+        if require_persisted:
+            raise
         persisted_id = None
+
+    if require_persisted and persisted_id is None:
+        raise RuntimeError("routing decision store returned no durable item id")
 
     # Publish live event so the web UI renders the chip immediately.
     session_stream.publish(
@@ -8576,9 +8614,8 @@ async def _remove_session_worktree_best_effort(
     Used for create-rollback (orphan cleanup) and opt-in session-delete
     cleanup. Host-reported git failures are logged so the caller's
     primary operation still completes. When ``fail_if_unavailable`` is
-    set, an unreachable host raises ``CONFLICT`` instead of skipping —
-    the session is left in place so the caller can retry without
-    worktree cleanup.
+    set, any unconfirmed removal raises instead of skipping — the session
+    is left in place as durable cleanup ownership.
 
     :param host_id: Host that owns the worktree, e.g.
         ``"host_a1b2c3d4..."``.
@@ -8598,9 +8635,10 @@ async def _remove_session_worktree_best_effort(
     :param exclude_conversation_id: The conversation whose delete triggered
         this removal, excluded from that check. Required with
         *conversation_store*.
-    :param fail_if_unavailable: When ``True``, raise ``CONFLICT`` if the
-        host cannot be reached to run git. Create-rollback leaves this
-        ``False`` so a failed create still surfaces its original error.
+    :param fail_if_unavailable: When ``True``, raise if the removal cannot
+        be confirmed, including a missing/offline host or a host git error.
+        Ordinary create rollback leaves this ``False`` so its original error
+        still surfaces.
     """
     from omnigent.server.routes._host_worktree import (
         WorktreeHostUnavailableError,
@@ -8671,7 +8709,14 @@ async def _remove_session_worktree_best_effort(
             worktree_path,
             host_id,
         )
-    except WorktreeProxyError:
+    except WorktreeProxyError as exc:
+        if fail_if_unavailable:
+            detail = " ".join(str(exc).split())[:1000] or "host rejected worktree removal"
+            raise OmnigentError(
+                f"Cannot confirm worktree removal: {detail}. "
+                "Fix the host git state, then retry session cleanup.",
+                code=ErrorCode.CONFLICT,
+            ) from exc
         _logger.warning(
             "Best-effort worktree removal (%s) failed for %s",
             reason,

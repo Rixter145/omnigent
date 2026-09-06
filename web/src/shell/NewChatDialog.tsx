@@ -107,6 +107,7 @@ import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
 import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
+import { isHostAbsolutePath, isWindowsDrivePath } from "./workspacePath";
 import {
   initialPrefillState,
   prefillDone,
@@ -441,25 +442,28 @@ export function ConnectHostInstructions({
  * Return true when ``workspace`` is acceptable to send to the backend.
  *
  * Per designs/SESSION_WORKSPACE_SELECTION.md: only fully-absolute
- * paths (starting with ``/``) are accepted. Tilde-prefixed and
- * relative paths are rejected because the server never expands ``~``
- * — that's the host's job, and the workspace request body must be
- * an unambiguous absolute path. Empty / whitespace-only input is
- * also rejected so the submit button is disabled until the user
- * has typed something usable.
+ * host paths are accepted. That includes POSIX paths starting with
+ * ``/`` and Windows drive paths such as ``C:\\repo``. Tilde-prefixed
+ * and relative paths are rejected because the server never expands
+ * ``~`` — that's the host's job, and the workspace request body must
+ * be an unambiguous absolute path. Empty / whitespace-only input is
+ * also rejected so the submit button is disabled until the user has
+ * typed something usable.
  *
  * @param workspace Value the user typed in the workspace input.
- * @returns true when ``workspace.trim()`` starts with ``/``.
+ * @returns true when ``workspace.trim()`` is an absolute host path.
  */
 export function isValidWorkspace(workspace: string): boolean {
-  return workspace.trim().startsWith("/");
+  return isHostAbsolutePath(workspace.trim());
 }
 
 /**
  * Normalize a host filesystem path for equality comparison.
  *
- * Trims whitespace and strips trailing slashes so ``"/repo/"`` and
- * ``"/repo"`` compare equal, preserving the root ``"/"``. Blank/whitespace
+ * Trims whitespace and strips trailing separators so ``"/repo/"`` and
+ * ``"/repo"`` compare equal, preserving the root ``"/"``. Windows drive
+ * paths additionally use ``/`` separators and case-fold, matching Windows'
+ * normal path equality (``C:\\Repo\\`` equals ``c:/repo``). Blank/whitespace
  * input returns ``null`` (no path), never the root. Lexical only — no ``..``
  * or symlink resolution — which suffices because the server stores canonical
  * absolute workspaces, so a freshly typed absolute path matches directly.
@@ -470,6 +474,13 @@ export function isValidWorkspace(workspace: string): boolean {
 export function normalizeWorkspacePath(path: string): string | null {
   const trimmed = path.trim();
   if (trimmed === "") return null;
+  if (isWindowsDrivePath(trimmed)) {
+    const windowsPath = trimmed.replace(/\\/g, "/").toLowerCase();
+    const strippedWindowsPath = windowsPath.replace(/\/+$/, "");
+    // Preserve drive-root semantics: ``c:`` alone is drive-relative, while
+    // both accepted inputs (``C:\\`` and ``C:/``) denote the absolute root.
+    return /^[a-z]:$/.test(strippedWindowsPath) ? `${strippedWindowsPath}/` : strippedWindowsPath;
+  }
   const stripped = trimmed.replace(/\/+$/, "");
   // All-slashes input (e.g. "///") collapses to the root.
   return stripped === "" ? "/" : stripped;

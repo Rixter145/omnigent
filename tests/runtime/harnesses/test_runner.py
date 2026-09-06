@@ -9,6 +9,10 @@ ground here would just duplicate.
 
 from __future__ import annotations
 
+import asyncio
+import json
+import os
+
 import pytest
 from fastapi import FastAPI
 
@@ -92,6 +96,56 @@ def test_parse_args_parent_pid_parses_integer() -> None:
     )
     assert ns.parent_pid == 12345
     assert isinstance(ns.parent_pid, int)
+
+
+def test_parse_args_requires_tcp_bind_for_readiness_endpoint() -> None:
+    """The parent handoff is meaningful only for the TCP runner transport."""
+    with pytest.raises(SystemExit) as excinfo:
+        _runner._parse_args(
+            [
+                "--harness",
+                "test",
+                "--module",
+                "tests.runtime.harnesses._test_harness",
+                "--socket",
+                "/tmp/example.sock",
+                "--ready-endpoint",
+                "127.0.0.1:1234",
+                "--conversation-id",
+                "conv_abc",
+            ]
+        )
+    assert excinfo.value.code == 2
+
+
+async def test_notify_parent_ready_sends_bound_authenticated_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runner reports its PID, conversation, port, and private bearer once."""
+    received: dict[str, object] = {}
+
+    async def accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        received.update(json.loads(await reader.readline()))
+        writer.write(b"ok\n")
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(accept, "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+    monkeypatch.setenv("OMNIGENT_HARNESS_READY_TOKEN", "private-bearer")
+    try:
+        await asyncio.to_thread(_runner._notify_parent_ready, f"{host}:{port}", "conv_abc", 45678)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert received == {
+        "conversation_id": "conv_abc",
+        "pid": os.getpid(),
+        "port": 45678,
+        "token": "private-bearer",
+    }
 
 
 def test_load_harness_app_import_error_exits(

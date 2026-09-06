@@ -16,6 +16,7 @@ const {
   candidatePaths,
   resolveCliPath,
   cliCommandParts,
+  getCliStatus,
   parseJsonLoose,
   matchesServer,
   parseDaemonRecord,
@@ -24,6 +25,60 @@ const {
   probeServerAuth,
   localHostId,
 } = require("../src/omnigent_cli");
+
+describe("getCliStatus installation guidance", () => {
+  it("returns the native uv/Python command on Windows, never the POSIX bootstrap", async () => {
+    const status = await getCliStatus(null, "win32");
+
+    assert.equal(status.installCommand, "uv tool install --python 3.12 omnigent");
+    assert.doesNotMatch(status.installCommand, /curl|\|\s*sh/i);
+  });
+
+  it("keeps the POSIX bootstrap guidance on non-Windows platforms", async () => {
+    const status = await getCliStatus(null, "linux");
+
+    assert.match(status.installCommand, /^curl -fsSL /);
+  });
+});
+
+describe("getCliStatus Windows cold probe", () => {
+  it("retries one transient first validation failure without changing the resolved path", async () => {
+    const cliPath = "C:\\Users\\Alice\\.local\\bin\\omnigent.exe";
+    let probes = 0;
+    const status = await getCliStatus(null, "win32", {
+      resolveCliPath: () => ({ path: cliPath, source: "candidate" }),
+      runCli: async () => {
+        probes += 1;
+        return probes === 1
+          ? { code: 1, stdout: "", stderr: "startup transient" }
+          : { code: 0, stdout: "omnigent 0.11.0", stderr: "" };
+      },
+    });
+
+    assert.equal(probes, 2);
+    assert.deepEqual(status, {
+      installed: true,
+      path: cliPath,
+      version: "omnigent 0.11.0",
+      source: "candidate",
+      installCommand: "uv tool install --python 3.12 omnigent",
+    });
+  });
+
+  it("reports an absent Windows CLI without invoking a validation retry", async () => {
+    let probes = 0;
+    const status = await getCliStatus(null, "win32", {
+      resolveCliPath: () => null,
+      runCli: async () => {
+        probes += 1;
+        return { code: 0, stdout: "omnigent 0.11.0", stderr: "" };
+      },
+    });
+
+    assert.equal(probes, 0);
+    assert.equal(status.installed, false);
+  });
+});
 
 describe("cliCommandParts", () => {
   it("keeps public CLI paths bare and adds fixed isaac argv without a shell", () => {
@@ -112,7 +167,7 @@ describe("parseLocalServerPidfile", () => {
 
 describe("candidatePaths", () => {
   it("probes both the omnigent name and the omni alias in each location", () => {
-    const paths = candidatePaths();
+    const paths = candidatePaths("linux", "/home/tester");
     // Every well-known dir contributes an `omnigent` and an `omni` entry.
     assert.ok(paths.some((p) => p.endsWith("/.local/bin/omnigent")));
     assert.ok(paths.some((p) => p.endsWith("/.local/bin/omni")));
@@ -122,10 +177,17 @@ describe("candidatePaths", () => {
   });
 
   it("lists the canonical omnigent name before the omni alias within a dir", () => {
-    const paths = candidatePaths();
+    const paths = candidatePaths("linux", "/home/tester");
     const og = paths.indexOf("/opt/homebrew/bin/omnigent");
     const omni = paths.indexOf("/opt/homebrew/bin/omni");
     assert.ok(og !== -1 && omni !== -1 && og < omni);
+  });
+
+  it("probes the current user's Windows uv-tool launchers when GUI PATH is minimal", () => {
+    assert.deepEqual(candidatePaths("win32", "C:\\Users\\Alice"), [
+      "C:\\Users\\Alice\\.local\\bin\\omnigent.exe",
+      "C:\\Users\\Alice\\.local\\bin\\omni.exe",
+    ]);
   });
 });
 
@@ -146,6 +208,17 @@ describe("resolveCliPath", () => {
       candidatePaths: () => ["/home/me/.local/bin/omnigent"],
     });
     assert.deepEqual(got, { path: "/custom/omnigent", source: "configured" });
+  });
+
+  it("keeps an explicit Windows path ahead of a discovered launcher", () => {
+    const configured = "D:\\tools\\omnigent.exe";
+    const candidate = "C:\\Users\\Alice\\.local\\bin\\omnigent.exe";
+    const got = resolveCliPath(configured, {
+      isExecutableFile: (p) => p === configured || p === candidate,
+      whichOmnigent: () => null,
+      candidatePaths: () => [candidate],
+    });
+    assert.deepEqual(got, { path: configured, source: "configured" });
   });
 
   it("falls back to PATH when the configured path is unusable", () => {

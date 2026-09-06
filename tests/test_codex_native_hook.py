@@ -719,6 +719,32 @@ def test_route_turn_allows_and_marks_an_already_pinned_session(
     assert (bridge_dir / MARKER_FILE).exists()
 
 
+def test_route_turn_denies_without_marker_so_repair_can_be_retried(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Required routing blocks the prompt but leaves no replay state behind."""
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(
+        codex_native_hook,
+        "_post_json",
+        lambda *a, **k: {
+            "action": "deny",
+            "terminal": True,
+            "rationale": "Required subscription routing unavailable; repair auth and retry.",
+        },
+    )
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["decision"] == "block"
+    assert "repair auth" in result["reason"]
+    assert not (bridge_dir / MARKER_FILE).exists()
+
+
 def test_route_turn_keeps_asking_after_a_non_terminal_no_op(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,

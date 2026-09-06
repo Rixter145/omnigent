@@ -34,6 +34,23 @@ def _no_local_gateway_answer(monkeypatch: pytest.MonkeyPatch) -> None:
     about the local gate override it explicitly.
     """
     monkeypatch.setattr("omnigent.smart_routing_cli.local_gateway_inference", dict)
+    # This module tests the native command's routing behavior, not the separate
+    # Windows platform guard. Keep that guard disabled even when pytest itself
+    # runs on Windows; a dedicated test below exercises the rejection.
+    monkeypatch.setattr("omnigent.cli_common.IS_WINDOWS", False)
+
+
+@pytest.mark.parametrize("command", ["claude", "codex"])
+def test_native_smart_routing_command_is_actionably_blocked_on_windows(
+    command: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("omnigent.cli_common.IS_WINDOWS", True)
+
+    result = CliRunner().invoke(cli, [command, "--smart-routing"])
+
+    assert result.exit_code == 1
+    assert "not supported on Windows" in result.output
+    assert "web UI" in result.output
 
 
 def _mock_local_gateway(monkeypatch: pytest.MonkeyPatch, gateway: dict[str, bool]) -> None:

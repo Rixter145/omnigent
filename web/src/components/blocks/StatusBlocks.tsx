@@ -629,7 +629,8 @@ export function RoutingDecisionCard({
   agent,
   routing,
 }: RoutingDecisionCardProps) {
-  const { harness, scope, decisionId, rawModel, attemptedOverride, routerSource } = routing ?? {};
+  const { harness, scope, decisionId, rawModel, attemptedOverride, routerSource, receipt } =
+    routing ?? {};
   const short = shortModelName(model);
   const rawShort = rawPickName(model, rawModel);
   const attemptedShort = attemptedPickName(model, attemptedOverride);
@@ -650,6 +651,7 @@ export function RoutingDecisionCard({
           ...(rawModel ? { raw_model: rawModel } : {}),
           ...(attemptedOverride ? { attempted_override: attemptedOverride } : {}),
           ...(routerSource ? { router_source: routerSource } : {}),
+          ...(receipt ? { receipt } : {}),
         },
         null,
         2,
@@ -665,6 +667,7 @@ export function RoutingDecisionCard({
       rawModel,
       attemptedOverride,
       routerSource,
+      receipt,
     ],
   );
   return (

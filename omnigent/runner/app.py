@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import dataclasses
 import functools
+import ipaddress
 import itertools
 import json
 import logging
@@ -159,7 +160,10 @@ from omnigent.runner.subagent_routing import (
     routing_class_from_snapshot,
     session_routing_class,
 )
-from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
+from omnigent.runtime.harnesses.process_manager import (
+    HarnessProcessManager,
+    NoLiveHarnessError,
+)
 from omnigent.runtime.prompt import (
     build_instructions,
     build_instructions_nullable,
@@ -179,6 +183,71 @@ from omnigent.tools.builtins.load_skill import (
 )
 
 _logger = logging.getLogger(__name__)
+
+
+def _safe_gateway_origin(value: object) -> str | None:
+    """Return only a strictly validated HTTP(S) origin suitable for logs."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(
+            character.isspace() or ord(character) < 32 or ord(character) == 127
+            for character in value
+        )
+    ):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not hostname
+        or "%" in hostname
+        or (port is None and parsed.netloc.rsplit("@", 1)[-1].endswith(":"))
+        or (port is not None and not 1 <= port <= 65535)
+    ):
+        return None
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        if len(hostname) > 253 or any(
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or re.fullmatch(r"[A-Za-z0-9-]+", label) is None
+            for label in hostname.split(".")
+        ):
+            return None
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    port_suffix = f":{port}" if port is not None else ""
+    return f"{parsed.scheme}://{host}{port_suffix}"
+
+
+def _safe_gateway_target(singular_url: object, plural_urls: object) -> str | None:
+    """Format a singular URL or Pi's JSON URL map for operational logging."""
+    if singular_url:
+        return _safe_gateway_origin(singular_url)
+    if not isinstance(plural_urls, str):
+        return None
+    try:
+        parsed_urls = json.loads(plural_urls)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed_urls, dict) or not parsed_urls:
+        return None
+
+    safe_urls: dict[str, str] = {}
+    for family, url in parsed_urls.items():
+        safe_url = _safe_gateway_origin(url)
+        if not isinstance(family, str) or safe_url is None:
+            return None
+        safe_urls[family] = safe_url
+    return json.dumps(safe_urls, sort_keys=True)
+
 
 # Claude-native session model listing: how long one request waits inline for
 # the probe before answering 503-pending, and how long the probe may stay
@@ -7374,13 +7443,17 @@ def create_runner_app(
         # terminal learns to switch models for this turn.
         _model_override = msg_body.get("model_override")
         if isinstance(_model_override, str) and _model_override:
-            harness_body["model_override"] = _model_override
-            _logger.info(
-                "_run_turn_bg: conv=%s received model_override=%s (forwarding to harness)",
-                conv,
-                _model_override,
-                extra={"session_id": conv},
-            )
+            from omnigent.subscription_defaults import provider_default_transport_model
+
+            transport_model = provider_default_transport_model(harness_name, _model_override)
+            if transport_model is not None:
+                harness_body["model_override"] = transport_model
+                _logger.info(
+                    "_run_turn_bg: conv=%s received model_override=%s (forwarding to harness)",
+                    conv,
+                    transport_model,
+                    extra={"session_id": conv},
+                )
         # Resolve the effort for this turn — an explicit per-event value, else
         # the session's remembered one — then deliver only what this harness can
         # accept. The persisted effort is validated at create against the union
@@ -7941,6 +8014,22 @@ def create_runner_app(
             _ds_sa = _session_sub_agent_names.get(conv_id)
             if _ds_sa and _session_sub_agent_resolved.get(conv_id) is False:
                 _warn_unresolved_sub_agent(conv_id, _ds_sa)
+            # The model override is forwarded in-band to the executor.  A
+            # subscription default is routing state, however, not a vendor
+            # model name; omitting it lets the logged-in CLI choose its default.
+            _in_band_model_override = _instr_body.get("model_override")
+            if isinstance(_in_band_model_override, str) and _in_band_model_override:
+                from omnigent.subscription_defaults import provider_default_transport_model
+
+                _transport_model = provider_default_transport_model(
+                    harness_name, _in_band_model_override
+                )
+                if _transport_model is None:
+                    _instr_body = {
+                        key: value for key, value in _instr_body.items() if key != "model_override"
+                    }
+                elif _transport_model != _in_band_model_override:
+                    _instr_body = {**_instr_body, "model_override": _transport_model}
             event_body = _wrap_as_message_event(_instr_body)
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _response_id: str | None = None
@@ -11795,7 +11884,16 @@ def _build_spawn_env_from_spec(
     effective_spec = spec
     if model_override is not None:
         executor = getattr(spec, "executor", None)
-        if hasattr(spec, "model_copy") and hasattr(executor, "model_copy"):
+        if dataclasses.is_dataclass(spec) and dataclasses.is_dataclass(executor):
+            # AgentSpec/ExecutorSpec are stdlib dataclasses.  The previous
+            # Pydantic-only branch silently left their source model/auth intact,
+            # so the builder could select a configured API key or gateway before
+            # the routed model was overlaid onto the final env.  Replace the
+            # executor first so the subscription sentinel reaches auth
+            # resolution as durable transport provenance.
+            copied_executor = dataclasses.replace(executor, model=model_override)
+            effective_spec = dataclasses.replace(spec, executor=copied_executor)
+        elif hasattr(spec, "model_copy") and hasattr(executor, "model_copy"):
             copied_executor = cast(_ModelCopyValue, executor).model_copy(
                 update={"model": model_override}
             )
@@ -11812,6 +11910,8 @@ def _build_spawn_env_from_spec(
             _build_codex_spawn_env,
             _build_copilot_spawn_env,
             _build_cursor_spawn_env,
+            _build_cursor_wsl_spawn_env,
+            _build_gemini_cli_spawn_env,
             _build_goose_spawn_env,
             _build_hermes_spawn_env,
             _build_kimi_spawn_env,
@@ -11830,6 +11930,10 @@ def _build_spawn_env_from_spec(
             env = _build_openai_agents_sdk_spawn_env(effective_spec)
         elif harness == "cursor":
             env = _build_cursor_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
+        elif harness == "cursor-wsl":
+            env = _build_cursor_wsl_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
+        elif harness == "gemini-cli":
+            env = _build_gemini_cli_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "antigravity":
             env = _build_antigravity_spawn_env(effective_spec)
         elif harness == "kimi":
@@ -11892,7 +11996,13 @@ def _build_spawn_env_from_spec(
     if model_override and env is not None:
         model_key = _HARNESS_MODEL_ENV_KEY.get(harness)
         if model_key is not None:
-            env[model_key] = model_override
+            from omnigent.subscription_defaults import provider_default_transport_model
+
+            transport_model = provider_default_transport_model(harness, model_override)
+            if transport_model is None:
+                env.pop(model_key, None)
+            else:
+                env[model_key] = transport_model
 
     # Routing visibility: log the resolved gateway target so operators can
     # confirm which provider a turn actually hits (api.anthropic.com /
@@ -11907,9 +12017,10 @@ def _build_spawn_env_from_spec(
             "%s gateway routing: gateway=%s base_url=%s profile=%s model=%s",
             harness,
             env.get(f"{prefix}_GATEWAY"),
-            # A harness that carries per-family URLs (pi) sets only the plural
-            # ``_BASE_URLS`` JSON; without the fallback it logs base_url=None.
-            env.get(f"{prefix}_GATEWAY_BASE_URL") or env.get(f"{prefix}_GATEWAY_BASE_URLS"),
+            _safe_gateway_target(
+                env.get(f"{prefix}_GATEWAY_BASE_URL"),
+                env.get(f"{prefix}_GATEWAY_BASE_URLS"),
+            ),
             env.get(f"{prefix}_DATABRICKS_PROFILE"),
             env.get(_HARNESS_MODEL_ENV_KEY.get(harness, f"{prefix}_MODEL")),
             extra={"session_id": session_id},

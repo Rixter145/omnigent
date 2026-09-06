@@ -410,6 +410,31 @@ def test_skills_filter_env_var_missing_falls_back_to_all(
     assert captured["skills_filter"] == "all"
 
 
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [("1", True), ("true", True), ("0", False), ("", False)],
+)
+def test_subscription_isolation_env_var_threads_to_executor(
+    raw_value: str,
+    expected: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the non-secret internal bridge enables subscription isolation."""
+    monkeypatch.setenv("HARNESS_CLAUDE_SDK_SUBSCRIPTION_ISOLATION", raw_value)
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    with patch(
+        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        _fake_init,
+    ):
+        claude_sdk_harness._build_claude_sdk_executor()
+
+    assert captured["subscription_isolation"] is expected
+
+
 def test_skills_filter_env_var_malformed_json_falls_back_to_all(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

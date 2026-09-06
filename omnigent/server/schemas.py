@@ -1277,6 +1277,9 @@ class SessionEventInput(BaseModel):
     model_override: str | None = None
     tools: list[dict[str, Any]] | None = None
     created_by: str | None = None
+    # Optional and additive: clients that retry an ambiguous delivery repeat
+    # this opaque key to recover their original durable input.
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class SessionGitOptions(BaseModel):

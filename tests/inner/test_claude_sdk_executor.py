@@ -2214,6 +2214,8 @@ class TestStreamEventStreaming(unittest.TestCase):
                             "tools": getattr(self.options, "tools", None),
                             "allowed_tools": getattr(self.options, "allowed_tools", None),
                             "env": getattr(self.options, "env", None),
+                            "has_setting_sources": "setting_sources" in self.options.__dict__,
+                            "setting_sources": getattr(self.options, "setting_sources", None),
                         }
                     )
                     result_session_id = (
@@ -2239,6 +2241,10 @@ class TestStreamEventStreaming(unittest.TestCase):
                 events_a1 = [e async for e in executor.run_turn(session_a, [], "")]
                 events_b1 = [e async for e in executor.run_turn(session_b, [], "")]
                 events_a2 = [e async for e in executor.run_turn(session_a, [], "")]
+                subscription_executor = ClaudeSDKExecutor(subscription_isolation=True)
+                subscription_events = [
+                    e async for e in subscription_executor.run_turn(session_a, [], "")
+                ]
 
             self.assertEqual(query_calls[0]["session_id"], "session-a")
             # ``--bare`` was previously included to suppress host config
@@ -2256,13 +2262,28 @@ class TestStreamEventStreaming(unittest.TestCase):
             self.assertEqual(query_calls[0]["allowed_tools"], [])
             self.assertEqual(query_calls[1]["session_id"], "session-b")
             self.assertEqual(query_calls[2]["session_id"], "session-a")
-            self.assertEqual(len(connect_calls), 2)
+            self.assertFalse(query_calls[0]["has_setting_sources"])
+            self.assertTrue(query_calls[3]["has_setting_sources"])
+            self.assertEqual(query_calls[3]["setting_sources"], [])
+            self.assertEqual(len(connect_calls), 3)
             self.assertEqual(len(executor._clients), 2)
             self.assertEqual(events_a1[-1].response, "result for hello")
             self.assertEqual(events_b1[-1].response, "result for bonjour")
             self.assertEqual(events_a2[-1].response, "result for hello")
+            self.assertEqual(subscription_events[-1].response, "result for hello")
 
         _run(_t())
+
+    def test_subscription_isolation_refuses_managed_provider_contract(self):
+        """The worker fails before constructing the Claude SDK client."""
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        with patch(
+            "omnigent.onboarding.ambient.claude_managed_subscription_conflicts",
+            return_value=("managed gateway",),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "managed gateway"):
+                ClaudeSDKExecutor(subscription_isolation=True)
 
     def test_os_env_spec_exposes_only_explicit_native_tools(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
