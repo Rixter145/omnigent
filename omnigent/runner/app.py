@@ -376,8 +376,10 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
     the detail already names the failure category for the caller.
 
     The runner's own log path is named so the reader can go read the cause
-    instead of hunting for it; it is home-relative (``~/…``) so it points
-    somewhere without leaking the account name.
+    instead of hunting for it. It is absolute: the detail is read on the
+    caller's side, where a home-relative ``~/…`` would expand against the
+    wrong home whenever the runner's differs (host-launched or sandboxed
+    runners) and point at a file that does not exist.
 
     :param exc: The caught exception, e.g. a ``RuntimeError`` from a harness
         spawn or an ``InvalidPath`` from path validation.
@@ -385,7 +387,7 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
         e.g. ``"harness spawn"``. Appears only in the server log.
     :returns: A non-sensitive string safe to return to clients, e.g.
         ``"Request failed on the runner; see the runner log for details:
-        ~/.omnigent/logs/runner/runner-conv_ab12.log"``.
+        /home/ci/.omnigent/logs/runner/runner-conv_ab12.log"``.
     """
     _logger.warning(
         "%s failed: %s",

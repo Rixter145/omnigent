@@ -266,10 +266,13 @@ def test_process_log_reference_names_this_process_log_file(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """The reference points at the captured log file, home-collapsed.
+    """The reference names the captured log file as an absolute path.
 
     Error messages that tell the reader to "see the runner log" embed this
-    string, so it must name the exact file and stay free of the account name.
+    string and travel off-process (runner -> server -> client), so it must
+    stay resolvable where it is read: a ``~``-collapsed path expands against
+    the READER's home, which for a host-launched or sandboxed runner is not
+    the home the log lives under.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Pytest temp dir, used as a fake ``$HOME``.
@@ -279,7 +282,7 @@ def test_process_log_reference_names_this_process_log_file(
     log_path = tmp_path / ".omnigent" / "logs" / "runner" / "runner-conv_ab12.log"
     monkeypatch.setenv(PROCESS_LOG_FILE_ENV_VAR, str(log_path))
 
-    assert process_log_reference("runner") == "~/.omnigent/logs/runner/runner-conv_ab12.log"
+    assert process_log_reference("runner") == str(log_path)
 
 
 def test_process_log_reference_falls_back_to_the_destination_dir(
@@ -289,13 +292,15 @@ def test_process_log_reference_falls_back_to_the_destination_dir(
     """Without a captured log file the reference points at the log directory.
 
     A runner started with stdio inherited has no log file of its own; the
-    error must still say where that destination's logs live.
+    error must still say where that destination's logs live — as an absolute
+    path even when the data dir sits under this process's home, for the same
+    off-process readers as the file reference.
 
     :param monkeypatch: Pytest monkeypatch fixture.
-    :param tmp_path: Pytest temp dir, used as the runtime data dir.
+    :param tmp_path: Pytest temp dir, used as ``$HOME`` and the runtime data dir.
     """
     monkeypatch.setattr("omnigent.process_logging._current_process_log_path", None)
-    monkeypatch.setattr(Path, "home", lambda: tmp_path / "elsewhere")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv(PROCESS_LOG_FILE_ENV_VAR, raising=False)
     monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path / "data"))
 

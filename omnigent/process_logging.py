@@ -284,6 +284,11 @@ def process_log_dir(destination: str, *, root: str | Path | None = None) -> Path
 def display_log_path(path: Path) -> str:
     """Format a log path for display, collapsing the home prefix to ``~``.
 
+    The collapse is only meaningful where the reader shares this process's
+    home: use it for output read on this process's own terminal. Messages
+    that leave the process (relayed runner errors) must carry the absolute
+    path — see :func:`process_log_reference`.
+
     :param path: Absolute path, typically under the runtime data dir, e.g.
         ``Path("/Users/alice/.omnigent/logs/runner/runner-ab12.log")``.
     :returns: ``"~/.omnigent/..."`` when *path* is under ``$HOME``,
@@ -394,20 +399,28 @@ def process_log_dir_reference(destination: str) -> str:
 def process_log_reference(destination: str) -> str:
     """Return a user-facing pointer to this process's log for error messages.
 
+    The reference is embedded in errors that leave this process (runner
+    failures relayed by the server and read on another host), so the path is
+    absolute, never collapsed to ``~``. A home-relative path only means
+    something in this process's own home context: a reader whose home differs
+    (host-launched or sandboxed runner) would expand ``~`` to a file that
+    does not exist.
+
     Falls back to the destination's log directory when the process has no
     captured log file (stdio inherited), so an error can always tell the
     reader where to look.
 
     :param destination: Process-log destination used for the directory
         fallback, e.g. ``"runner"``.
-    :returns: A display path, e.g.
-        ``"~/.omnigent/logs/runner/runner-conv_ab12-20260806-101500.log"``,
-        or ``"~/.omnigent/logs/runner/"`` when no log file is configured.
+    :returns: An absolute path, e.g.
+        ``"/home/ci/.omnigent/logs/runner/runner-conv_ab12-20260806-101500.log"``,
+        or ``"/home/ci/.omnigent/logs/runner/"`` when no log file is
+        configured.
     """
     path = current_process_log_path()
     if path is not None:
-        return display_log_path(path)
-    return process_log_dir_reference(destination)
+        return str(path)
+    return f"{process_log_dir(destination)}/"
 
 
 def _terminal_stream() -> TextIO | None:

@@ -84,7 +84,7 @@ from omnigent.inner.executor import (
     describe_exception,
 )
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
-from omnigent.process_logging import current_process_log_path, display_log_path
+from omnigent.process_logging import current_process_log_path
 
 logger = logging.getLogger(__name__)
 
@@ -485,7 +485,9 @@ class AcpExecutor(Executor):
         Builds on :func:`describe_exception` (which keeps a bare
         ``TimeoutError`` from rendering blank), then appends what the agent
         printed — that text ("no API key", "unknown flag") is usually the actual
-        diagnosis — and the log file so the full traceback is findable.
+        diagnosis — and the log file so the full traceback is findable. The log
+        path is absolute: this string is read off-process (a UI toast), where a
+        ``~``-collapsed path would expand against the wrong home.
         """
         detail = describe_exception(exc)
         if self._recent_stderr:
@@ -497,7 +499,7 @@ class AcpExecutor(Executor):
             detail = f"{detail}; {self._config.name} stderr: {tail}"
         log_path = current_process_log_path()
         if log_path is not None:
-            detail = f"{detail} (harness log: {display_log_path(log_path)})"
+            detail = f"{detail} (harness log: {log_path})"
         return detail
 
     async def _read_stderr(self) -> None:

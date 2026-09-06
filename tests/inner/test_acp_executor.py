@@ -1867,6 +1867,26 @@ def test_startup_error_names_the_exception_type_when_str_is_empty() -> None:
     assert "TimeoutError" in ex._startup_error_message(TimeoutError())
 
 
+def test_startup_error_names_the_harness_log_as_an_absolute_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The harness-log pointer stays absolute even when the log sits under $HOME.
+
+    The startup error travels off-process (runner -> server -> UI toast), so a
+    ``~``-collapsed path would be expanded against the READER's home — for a
+    host-launched or sandboxed runner that is not the home the log lives under.
+    """
+    log_path = tmp_path / ".omnigent" / "logs" / "harness" / "harness-conv_ab12.log"
+    monkeypatch.setattr("omnigent.process_logging._current_process_log_path", log_path)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    ex = AcpExecutor(AcpAgentConfig(command="x", name="A"))
+    msg = ex._startup_error_message(TimeoutError())
+    assert f"(harness log: {log_path})" in msg
+    assert "~" not in msg
+
+
 # ---------------------------------------------------------------------------
 # Process lifecycle: a torn-down executor must not strand the agent
 # ---------------------------------------------------------------------------
