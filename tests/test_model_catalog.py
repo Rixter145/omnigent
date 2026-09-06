@@ -294,12 +294,18 @@ def test_resolve_provider_databricks_default(
 def test_resolve_provider_antigravity_native_aliases(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
 ) -> None:
-    """Every native agy spelling reaches the same provider resolver."""
+    """Every native agy spelling resolves to the CLI's own login.
+
+    Even a spec-level ``auth:`` api-key block does not change the readout:
+    the native agy launch seeds no credential (agy inherits its own
+    ``~/.gemini`` login), so reporting the spec key as usable would name a
+    credential the spawned CLI never consumes.
+    """
     _isolate_config(monkeypatch, tmp_path, "")
     spec = _worker_spec(harness, auth=ApiKeyAuth(api_key="gemini-test-key"))
     provider = resolve_model_provider(spec, harness)
-    assert provider.kind == "key"
-    assert provider.api_key == "gemini-test-key"
+    assert provider.kind == "subscription"
+    assert provider.cli == "agy"
 
 
 def test_resolve_provider_key_kind_resolves_family_credential(
@@ -393,6 +399,67 @@ def test_resolve_provider_cursor_is_cli_login(
     provider = resolve_model_provider(_worker_spec(harness), harness)
     assert provider.kind == "subscription"
     assert provider.cli == "cursor-agent"
+
+
+@pytest.mark.parametrize(
+    "harness", ["antigravity-native", "native-antigravity", "agy-native", "native-agy"]
+)
+def test_resolve_provider_native_agy_is_cli_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
+) -> None:
+    """Native agy harnesses resolve to the agy CLI's own login, not ``none``.
+
+    The native agy launch uses the CLI's own credential unconditionally
+    (its Google OAuth login, or a ``GEMINI_API_KEY`` the CLI reads itself),
+    so resolution must not route through the SDK sibling's provider lookup
+    — that asked the wrong family and reported a dispatchable worker as
+    dead.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    :param harness: The native agy harness spelling under test.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    provider = resolve_model_provider(_worker_spec(harness), harness)
+    assert provider.kind == "subscription"
+    assert provider.cli == "agy"
+
+
+def test_resolve_provider_native_agy_stable_under_ambient_gemini_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An ambient ``GEMINI_API_KEY`` keeps the usable CLI-login readout.
+
+    The agy CLI resolves the key itself at launch; the readout must stay
+    the subscription shape rather than mis-resolving the key under another
+    family (the old path asked the openai family and reported ``none``).
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    monkeypatch.setenv("GEMINI_API_KEY", "unit-test-key")
+    provider = resolve_model_provider(_worker_spec("antigravity-native"), "antigravity-native")
+    assert provider.kind == "subscription"
+    assert provider.cli == "agy"
+
+
+def test_resolve_provider_sdk_antigravity_keeps_provider_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The SDK ``antigravity`` harness still resolves real providers.
+
+    Only the native TUI spellings short-circuit to the CLI-login readout;
+    the in-process SDK harness genuinely consumes configured providers, so
+    an unconfigured one must keep reporting ``none`` rather than a login
+    it does not have.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    provider = resolve_model_provider(_worker_spec("antigravity"), "antigravity")
+    assert provider.kind == "none"
 
 
 def test_resolve_provider_spec_databricks_auth_wins(
@@ -1201,6 +1268,29 @@ def test_cursor_listing_failure_degrades_to_usable_static_row(
     assert listing.models == ()
     # The note must say the worker still runs, not the dead-worker signal.
     assert "can still run" in listing.note
+    assert "cannot run here" not in listing.note
+
+
+def test_native_agy_listing_is_usable_subscription_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A native agy worker lists the usable subscription shape, not ``none``.
+
+    Same shape the sibling subscription CLI logins (claude/codex-native)
+    report: ``source="static"`` with an empty pre-launch list and a note
+    that the live listing comes from probing the harness — never the
+    dead-worker ``none`` row whose note tells orchestrators the worker
+    cannot run here.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    listing = list_models_for_worker(_worker_spec("antigravity-native"), "antigravity-native")
+    assert listing.source == "static"
+    assert listing.verified is False
+    assert listing.models == ()
+    assert "agy" in listing.note
     assert "cannot run here" not in listing.note
 
 

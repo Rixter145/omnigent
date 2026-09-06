@@ -149,12 +149,9 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
     # Native Kimi TUI harness shares the multi-provider kimi resolution path.
     "kimi-native": "kimi",
     "qwen": "qwen",
-    # The native agy TUI bridge resolves its provider via the SDK sibling,
-    # mirroring the claude-native -> claude-sdk rule above.
-    "antigravity-native": "antigravity",
-    "native-antigravity": "antigravity",
-    "agy-native": "antigravity",
-    "native-agy": "antigravity",
+    # NB: the native agy TUI spellings are intentionally absent — they
+    # short-circuit to a subscription readout before this map is consulted
+    # (see _ANTIGRAVITY_NATIVE_HARNESSES), mirroring the cursor rule below.
 }
 
 # cursor-agent always routes through its own stored login — there is no
@@ -162,6 +159,18 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
 # short-circuits to a subscription-style readout instead of reporting the
 # harness as having "no model-provider resolution".
 _CURSOR_HARNESSES: frozenset[str] = frozenset({"cursor", "cursor-native", "native-cursor"})
+
+# The native agy TUI always launches on the CLI's own credential —
+# ``resolve_native_antigravity_launch()`` returns ``auth_mode="subscription"``
+# unconditionally (agy inherits the ``~/.gemini`` Google login, or reads
+# ``GEMINI_API_KEY`` itself) — so there is no omnigent-side provider for this
+# readout to resolve or fail. Resolving via the SDK sibling asked the wrong
+# family and reported a dispatchable worker as dead; short-circuit to a
+# subscription-style readout instead, exactly like the cursor rule above.
+# The SDK ``antigravity`` harness keeps real provider resolution.
+_ANTIGRAVITY_NATIVE_HARNESSES: frozenset[str] = frozenset(
+    {"antigravity-native", "native-antigravity", "agy-native", "native-agy"}
+)
 
 # Preferred inline family per single-family harness (pi consumes both).
 _KEY_AUTH_FAMILY: dict[str, str] = {
@@ -605,6 +614,9 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
         return ResolvedModelProvider(
             kind=SUBSCRIPTION_KIND, cli="cursor-agent", detail="cursor-agent CLI login"
         )
+
+    if (harness or "") in _ANTIGRAVITY_NATIVE_HARNESSES:
+        return ResolvedModelProvider(kind=SUBSCRIPTION_KIND, cli="agy", detail="agy CLI login")
 
     harness_type = _PROVIDER_RESOLUTION_HARNESS.get(harness or "")
     if harness_type is None:
