@@ -404,21 +404,30 @@ class FunctionCallOutputData(BaseModel):
             content blocks carrying base64 payloads.
         :returns: The result with binary payloads replaced by a marker.
         """
-        # Fast path: no bare-payload key and no data: URI anywhere.
-        if '"data"' not in value and "data:" not in value:
+        # Fast path: no bare-payload key and no data: URI anywhere. The
+        # data: scheme (and the redactor regex) is case-insensitive, so
+        # guard against a lowercased copy.
+        lowered = value.lower()
+        if '"data"' not in lowered and "data:" not in lowered:
             return value
         try:
             parsed = json.loads(value)
-        except ValueError:
+        except (ValueError, RecursionError):
             parsed = None
         if not isinstance(parsed, (dict, list)):
             # Plain-text output: only data: URIs can carry a payload.
             return cast(str, redact_inline_data_uris(value, _tool_result_payload_omitted))
-        redacted = redact_binary_payloads(parsed, _tool_result_payload_omitted)
-        if redacted == parsed:
-            # Preserve the producer's exact serialization when clean.
-            return value
-        return json.dumps(redacted)
+        try:
+            redacted = redact_binary_payloads(parsed, _tool_result_payload_omitted)
+            if redacted == parsed:
+                # Preserve the producer's exact serialization when clean.
+                return value
+            return json.dumps(redacted)
+        except RecursionError:
+            # Pathologically nested output: redact what the regex reaches
+            # rather than raising — the row is re-validated on every read,
+            # so a raise here would make the stored conversation unloadable.
+            return cast(str, redact_inline_data_uris(value, _tool_result_payload_omitted))
 
 
 class ErrorData(BaseModel):

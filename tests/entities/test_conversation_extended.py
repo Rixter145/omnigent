@@ -8,6 +8,7 @@ _validate_type_matches_data, and Conversation field defaults.
 from __future__ import annotations
 
 import json
+import sys
 from typing import Any
 
 import pytest
@@ -382,6 +383,33 @@ def test_tool_result_strip_is_idempotent() -> None:
     twice = FunctionCallOutputData(call_id="call_1", output=once.output)
 
     assert twice.output == once.output
+
+
+def test_tool_result_strips_uppercase_scheme_data_uri() -> None:
+    """The data: scheme is case-insensitive; an uppercase DATA: URI must
+    not slip past the fast-path guard and persist inline."""
+    output = f"here is the screenshot: DATA:image/png;base64,{_IMAGE_BASE64}"
+
+    fco = FunctionCallOutputData(call_id="call_1", output=output)
+
+    assert _IMAGE_BASE64 not in fco.output
+    assert fco.output.startswith("here is the screenshot: ")
+
+
+def test_tool_result_pathological_nesting_does_not_fail_validation() -> None:
+    """A deeply nested output must degrade gracefully, never raise out of
+    the validator — the row is re-validated on read, so a raise would make
+    the stored conversation unloadable."""
+    depth = sys.getrecursionlimit() + 100
+    output = "[" * depth + '{"type": "image", "data": "payload"}' + "]" * depth
+
+    data = parse_item_data(
+        "function_call_output",
+        {"type": "function_call_output", "call_id": "call_1", "output": output},
+    )
+
+    assert isinstance(data, FunctionCallOutputData)
+    assert isinstance(data.output, str)
 
 
 # ── NativeToolData ────────────────────────────────────
