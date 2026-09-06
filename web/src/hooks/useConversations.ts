@@ -189,6 +189,14 @@ export interface Conversation {
    */
   archived?: boolean;
   /**
+   * Client-only: a `temp:` row shown while `createSession` is in flight (the
+   * navigate-first new-chat window). There is no server session behind it yet,
+   * so the sidebar disables per-row mutations (rename / delete / archive / pin /
+   * move) until it's rekeyed to the real id — otherwise they'd hit
+   * `/v1/sessions/temp:*`. Never set on a server row.
+   */
+  provisional?: boolean;
+  /**
    * Total review comments (any status) on this session. Together with
    * `comments_updated_at` it forms a change fingerprint: an add or edit
    * bumps the timestamp, a delete changes the count. SessionUpdatesProvider

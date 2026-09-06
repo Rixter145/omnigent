@@ -165,8 +165,12 @@ export interface SendOptions {
   pinnedConversationId?: string;
 }
 
-/** A title-less conversation row for the sidebar cache (renders like a fresh session). */
-function makeConvRow(id: string): Conversation {
+/**
+ * A title-less conversation row for the sidebar cache (renders like a fresh
+ * session). `provisional` marks the client-only `temp:` row so the sidebar
+ * disables per-row mutations until it's rekeyed to the real id.
+ */
+function makeConvRow(id: string, provisional = false): Conversation {
   const now = Math.floor(Date.now() / 1000);
   return {
     id,
@@ -176,6 +180,7 @@ function makeConvRow(id: string): Conversation {
     updated_at: now,
     labels: {},
     permission_level: null,
+    ...(provisional ? { provisional: true } : {}),
   };
 }
 
@@ -244,7 +249,7 @@ export function beginLocalConversation(
 
   // Sidebar row under the same id the URL shows.
   recordOptimisticTitle(tempConvId, text);
-  upsertConvRow(makeConvRow(tempConvId));
+  upsertConvRow(makeConvRow(tempConvId, true));
 
   const fileBlocks: MessageContentBlock[] = (files ?? []).map((file) => {
     const filename = file.name || "image.png";

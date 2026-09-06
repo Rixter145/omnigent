@@ -688,12 +688,15 @@ export function AppShell() {
   // resolution lands (a no-op transition once it does).
   const stickyRootRef = useRef<string | null>(null);
   const queryClient = useQueryClient();
-  const walkedRoot = useRootSessionId(conversationId ?? null, activeSession?.parentSessionId);
+  // Derive the root from `serverConversationId` (undefined for a temp id) so the
+  // fallback below never yields `temp:*` — otherwise `useChildSessions` would
+  // fetch `GET /v1/sessions/temp:*/child_sessions` during the create window.
+  const walkedRoot = useRootSessionId(serverConversationId ?? null, activeSession?.parentSessionId);
   const { rootSessionId, rootSessionResolved } = useMemo(() => {
-    if (!conversationId) return { rootSessionId: null, rootSessionResolved: false };
+    if (!serverConversationId) return { rootSessionId: null, rootSessionResolved: false };
     // Snapshot resolved for a top-level session → it is its own root.
     if (activeSession && activeSession.parentSessionId == null) {
-      return { rootSessionId: conversationId, rootSessionResolved: true };
+      return { rootSessionId: serverConversationId, rootSessionResolved: true };
     }
     // Snapshot resolved for a descendant + walk complete → authoritative.
     if (activeSession && walkedRoot) {
@@ -704,18 +707,18 @@ export function AppShell() {
     const sticky = stickyRootRef.current;
     if (
       sticky !== null &&
-      (sticky === conversationId ||
-        cachedTreeContains(queryClient, sticky, conversationId, MAX_TREE_DEPTH))
+      (sticky === serverConversationId ||
+        cachedTreeContains(queryClient, sticky, serverConversationId, MAX_TREE_DEPTH))
     ) {
       return { rootSessionId: sticky, rootSessionResolved: true };
     }
     // No sticky context (e.g. a deep link straight into a sub-agent):
     // fall back one hop until the walk resolves the true root.
     return {
-      rootSessionId: activeSession?.parentSessionId ?? conversationId,
+      rootSessionId: activeSession?.parentSessionId ?? serverConversationId,
       rootSessionResolved: false,
     };
-  }, [conversationId, activeSession, walkedRoot, queryClient]);
+  }, [serverConversationId, activeSession, walkedRoot, queryClient]);
   // One-shot fetch (no polling) for the Subagents tab's count badge.
   // SubagentsPanel mounts its own polling usage of the hook against
   // the same rootSessionId, so the cache is shared.
